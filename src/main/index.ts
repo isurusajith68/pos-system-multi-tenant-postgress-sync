@@ -28,8 +28,11 @@ import { backupService } from "./lib/backup";
 import { printerService } from "./lib/printer";
 import { scannerService } from "./lib/scanner";
 import { licenseService } from "./lib/license";
+import { bootstrapLocalFromServer, ensureDeviceId, setTenantId, syncNow } from "./lib/sync";
+import { getSyncStatus, startSyncWorker } from "./lib/sync-worker";
 // import { initializeDatabase } from "./lib/database-init"; // Disabled: Database initialization no longer needed
 import { getPrismaClient, setActiveSchema } from "./lib/prisma";
+import { initializeDatabase } from "./lib/database-init";
 
 // Configure logging
 log.transports.file.level = "info";
@@ -348,6 +351,15 @@ app.whenReady().then(async () => {
       return await employeeService.findByEmail(email);
     } catch (error) {
       console.error("Error finding employee by email:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("employees:findByEmailOnline", async (_, email, schemaName) => {
+    try {
+      return await employeeService.findByEmailOnline(email, schemaName);
+    } catch (error) {
+      console.error("Error finding employee by email (online):", error);
       throw error;
     }
   });
@@ -1530,6 +1542,16 @@ app.whenReady().then(async () => {
     return join(app.getPath("userData"), "logs", "main.log");
   });
 
+  ipcMain.handle("sqlite:getPath", async () => {
+    try {
+      const { getLocalDbPath } = await import("./lib/local-sqlite");
+      return getLocalDbPath();
+    } catch (error) {
+      console.error("Error getting SQLite path:", error);
+      throw error;
+    }
+  });
+
   ipcMain.handle("logs:getLogContent", async (_, maxLines = 100) => {
     const logPath = join(app.getPath("userData"), "logs", "main.log");
 
@@ -1630,6 +1652,14 @@ app.whenReady().then(async () => {
       const normalizedSchema =
         typeof schemaName === "string" && schemaName.trim().length > 0 ? schemaName : null;
       setActiveSchema(normalizedSchema);
+      if (normalizedSchema) {
+        const { tenantService } = await import("./lib/database");
+        const { setTenantId } = await import("./lib/sync");
+        const tenant = await tenantService.findBySchemaName(normalizedSchema);
+        if (tenant?.id) {
+          setTenantId(tenant.id);
+        }
+      }
       return true;
     } catch (error) {
       console.error("Error setting active schema:", error);
@@ -1775,9 +1805,29 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Sync IPC handlers
+  ipcMain.handle("sync:status", async () => {
+    return getSyncStatus();
+  });
+
+  ipcMain.handle("sync:run", async () => {
+    return await syncNow();
+  });
+
+  ipcMain.handle("sync:setTenant", async (_, tenantId: string) => {
+    setTenantId(tenantId);
+    return { success: true };
+  });
+
+  ipcMain.handle("sync:bootstrap", async () => {
+    return await bootstrapLocalFromServer();
+  });
+
   // License activation is not required - start the app directly
   await createWindow();
   setupAutoUpdater();
+  startSyncWorker();
+  ensureDeviceId();
   if (!is.dev && app.isPackaged) {
     autoUpdater.checkForUpdatesAndNotify().catch((error) => {
       log.error("Error while checking for updates:", error);

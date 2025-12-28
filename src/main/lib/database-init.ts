@@ -19,10 +19,10 @@ export async function createTenantTables(): Promise<void> {
     await prisma.$queryRaw`
       CREATE TABLE IF NOT EXISTS public.tenants (
         id TEXT PRIMARY KEY,
-        schema_name TEXT NOT NULL UNIQUE,
-        company_name TEXT,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        "schemaName" TEXT NOT NULL UNIQUE,
+        "businessName" TEXT,
+        "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
     `;
 
@@ -30,10 +30,10 @@ export async function createTenantTables(): Promise<void> {
     await prisma.$queryRaw`
       CREATE TABLE IF NOT EXISTS public.tenant_users (
         id TEXT PRIMARY KEY,
-        tenant_id TEXT NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+        "tenantId" TEXT NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
         email TEXT NOT NULL UNIQUE,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
     `;
 
@@ -43,7 +43,7 @@ export async function createTenantTables(): Promise<void> {
     `;
 
     await prisma.$queryRaw`
-      CREATE INDEX IF NOT EXISTS idx_tenant_users_tenant_id ON public.tenant_users(tenant_id);
+      CREATE INDEX IF NOT EXISTS idx_tenant_users_tenant_id ON public.tenant_users("tenantId");
     `;
 
     // Insert sample data for testing
@@ -52,14 +52,14 @@ export async function createTenantTables(): Promise<void> {
 
     // Insert tenant (ignore if exists)
     await prisma.$queryRaw`
-      INSERT INTO public.tenants (id, schema_name, company_name)
+      INSERT INTO public.tenants (id, "schemaName", "businessName")
       VALUES (${tenantId}, ${schemaName}, 'Test Company')
       ON CONFLICT (id) DO NOTHING;
     `;
 
     // Insert tenant user (ignore if exists)
     await prisma.$queryRaw`
-      INSERT INTO public.tenant_users (id, tenant_id, email)
+      INSERT INTO public.tenant_users (id, "tenantId", email)
       VALUES ('user-001', ${tenantId}, 'admin@posystem.com')
       ON CONFLICT (email) DO NOTHING;
     `;

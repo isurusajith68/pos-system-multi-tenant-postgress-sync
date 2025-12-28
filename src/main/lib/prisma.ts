@@ -40,7 +40,7 @@ export function getActiveSchema(): string | null {
   return activeSchemaName;
 }
 
-function getPublicPrismaClient(): PrismaClient {
+function getPublicPrismaClientInternal(): PrismaClient {
   // Return existing instance if already created
   if (publicPrismaInstance) {
     return publicPrismaInstance;
@@ -57,7 +57,11 @@ function getPublicPrismaClient(): PrismaClient {
   }
 }
 
-function getTenantPrismaClient(schemaName: string): PrismaClient {
+export function getPublicPrismaClient(): PrismaClient {
+  return getPublicPrismaClientInternal();
+}
+
+function getTenantPrismaClientInternal(schemaName: string): PrismaClient {
   const normalizedSchema = schemaName.trim();
   const existingClient = tenantPrismaInstances.get(normalizedSchema);
   if (existingClient) {
@@ -69,6 +73,10 @@ function getTenantPrismaClient(schemaName: string): PrismaClient {
   tenantPrismaInstances.set(normalizedSchema, tenantClient);
   evictTenantClientsIfNeeded();
   return tenantClient;
+}
+
+export function getTenantPrismaClient(schemaName: string): PrismaClient {
+  return getTenantPrismaClientInternal(schemaName);
 }
 
 function touchTenantClient(schemaName: string, client: PrismaClient): void {

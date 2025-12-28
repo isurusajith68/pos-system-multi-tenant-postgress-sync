@@ -512,6 +512,10 @@ const api = {
 
   showToast: (options: { type: "success" | "error" | "warning" | "info"; message: string }) =>
     ipcRenderer.invoke("show-toast", options)
+  ,
+  sqlite: {
+    getPath: () => ipcRenderer.invoke("sqlite:getPath")
+  }
 };
 
 if (process.contextIsolated) {

@@ -75,6 +75,7 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
 
       // Step 1: Find tenant user by email in public schema
       const tenantUser = await window.electron.ipcRenderer.invoke("tenantUsers:findByEmail", email);
+      console.log(tenantUser)
       if (!tenantUser) {
         console.log("No tenant user found for email:", email);
         toast.error("Invalid email or password");
@@ -117,12 +118,20 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
       }
 
       await setActiveSchema(schemaName);
+      await window.electron.ipcRenderer.invoke("sync:setTenant", tenantUser.tenantId);
 
-      const employee = await window.electron.ipcRenderer.invoke(
+      let employee = await window.electron.ipcRenderer.invoke(
         "employees:findByEmail",
         email,
         schemaName
       );
+      if (!employee) {
+        employee = await window.electron.ipcRenderer.invoke(
+          "employees:findByEmailOnline",
+          email,
+          schemaName
+        );
+      }
       if (!employee) {
         console.log("No employee found in tenant schema for email:", email);
         await clearActiveSchema();
@@ -146,7 +155,6 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
         );
         const employeeWithRoles = employees.find((emp: Employee) => emp.id === employee.id);
 
-        // Add tenant information and subscription data to the user object
         const userWithTenant = {
           ...(employeeWithRoles || employee),
           tenantId: tenantUser.tenantId,
@@ -209,8 +217,14 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
                 user.email
               );
               schemaName = tenantUser?.schemaName ?? null;
+              if (tenantUser?.tenantId) {
+                await window.electron.ipcRenderer.invoke("sync:setTenant", tenantUser.tenantId);
+              }
             }
             await setActiveSchema(schemaName);
+            if (user.tenantId) {
+              await window.electron.ipcRenderer.invoke("sync:setTenant", user.tenantId);
+            }
             const employee = await window.electron.ipcRenderer.invoke(
               "employees:findByEmail",
               user.email,

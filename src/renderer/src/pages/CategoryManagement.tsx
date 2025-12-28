@@ -241,7 +241,6 @@ const CategoryManagement: React.FC = () => {
       setLoading(false);
     }
   };
-
   // Invoice-style Pagination component
   const InvoicePagination = ({
     currentPage,
@@ -538,10 +537,7 @@ const CategoryManagement: React.FC = () => {
                   </tr>
                 ) : (
                   paginatedCategories.map((category) => (
-                    <tr
-                      key={category.id}
-                      className="hover:bg-gray-50  dark:hover:bg-slate-950"
-                    >
+                    <tr key={category.id} className="hover:bg-gray-50  dark:hover:bg-slate-950">
                       <td className="px-4 py-3 text-sm font-medium text-gray-900 dark:text-slate-100">
                         <div className="flex items-center">
                           <span className="mr-2">{category.parentCategoryId ? "📁" : "🏠"}</span>

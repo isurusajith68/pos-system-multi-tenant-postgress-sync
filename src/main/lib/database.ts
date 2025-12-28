@@ -1,7 +1,9 @@
 import { randomUUID } from "crypto";
-import { getActiveSchema, getPrismaClient } from "./prisma";
+import { getActiveSchema, getPrismaClient, getTenantPrismaClient } from "./prisma";
 import * as bcrypt from "bcrypt";
 import { validateAndFormatQuantity } from "./quantityValidation";
+import { getLocalDb } from "./local-sqlite";
+import { ensureDeviceId, getTenantId } from "./sync";
 
 const DEFAULT_DB_CONCURRENCY = 5;
 
@@ -201,6 +203,114 @@ const clearProductCache = (schemaName?: string): void => {
   }
 };
 
+const SETTINGS_CACHE_TTL_MS = 30000;
+
+type SettingsCacheEntry = {
+  data: any[];
+  expiresAt: number;
+};
+
+let settingsCache: SettingsCacheEntry | null = null;
+
+const clearSettingsCache = (): void => {
+  settingsCache = null;
+};
+
+const getSettingsCached = async (): Promise<any[]> => {
+  const now = Date.now();
+  if (settingsCache && settingsCache.expiresAt > now) {
+    return settingsCache.data;
+  }
+
+  const db = getLocalDb();
+  const rows = db
+    .prepare("SELECT * FROM settings WHERE deleted_at IS NULL ORDER BY key ASC")
+    .all() as any[];
+
+  const mapped = rows.map((row) => ({
+    key: row.key,
+    value: row.value,
+    type: row.type,
+    category: row.category,
+    description: row.description,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  }));
+
+  settingsCache = {
+    data: mapped,
+    expiresAt: now + SETTINGS_CACHE_TTL_MS
+  };
+
+  return mapped;
+};
+
+const nowIso = (): string => new Date().toISOString();
+
+const requireTenantId = (): string => {
+  const tenantId = getTenantId();
+  if (!tenantId) {
+    throw new Error("Missing tenant_id in local_meta");
+  }
+  return tenantId;
+};
+
+const enqueueOutbox = (
+  tableName: string,
+  rowId: string,
+  op: "insert" | "update" | "delete",
+  version: number,
+  payload: Record<string, unknown>
+): void => {
+  const tenantId = requireTenantId();
+  const deviceId = ensureDeviceId();
+  const db = getLocalDb();
+
+  db.prepare(
+    `
+      INSERT INTO sync_outbox (
+        outbox_id,
+        batch_id,
+        tenant_id,
+        device_id,
+        table_name,
+        row_id,
+        op,
+        version,
+        payload,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `
+  ).run(
+    randomUUID(),
+    null,
+    tenantId,
+    deviceId,
+    tableName,
+    rowId,
+    op,
+    version,
+    JSON.stringify(payload),
+    nowIso()
+  );
+};
+
+const buildCompositeRowId = (parts: Record<string, string>): string => {
+  return JSON.stringify(parts);
+};
+
+const updateLocalProductStockLevel = (productId: string, newStockLevel: number): void => {
+  const db = getLocalDb();
+  db.prepare(
+    `
+      UPDATE products
+      SET stock_level = ?, updated_at = ?
+      WHERE product_id = ?
+    `
+  ).run(newStockLevel, nowIso(), productId);
+};
+
 const buildInventoryWhereClause = async (
   prisma: ReturnType<typeof getPrismaClient>,
   filters?: InventoryFilters
@@ -322,128 +432,297 @@ async function runWithConcurrency<T, R>(
 // Centralized stock level update utility
 export const updateProductStockLevel = async (
   productId: string,
-  newStockLevel: number,
-  prismaInstance?: any // eslint-disable-line @typescript-eslint/no-explicit-any
+  newStockLevel: number
 ): Promise<{ id: string; name: string; stockLevel: number }> => {
-  const prisma = prismaInstance || getPrismaClient();
+  const db = getLocalDb();
   const formattedStockLevel = validateAndFormatQuantity(newStockLevel);
+  const existing = db
+    .prepare("SELECT product_id, name FROM products WHERE product_id = ? AND deleted_at IS NULL")
+    .get(productId);
 
-  const updatedProduct = await prisma.product.update({
-    where: { id: productId },
-    data: { stockLevel: formattedStockLevel },
-    select: {
-      id: true,
-      name: true,
-      stockLevel: true
-    }
-  });
+  if (!existing) {
+    throw new Error("Product not found");
+  }
+
+  updateLocalProductStockLevel(productId, formattedStockLevel);
   clearProductCache();
-  return updatedProduct;
+  return {
+    id: existing.product_id,
+    name: existing.name,
+    stockLevel: formattedStockLevel
+  };
 };
 
 // Sync product stock level with total inventory
 export const syncProductStockWithInventory = async (
-  productId: string,
-  prismaInstance?: ReturnType<typeof getPrismaClient>
+  productId: string
 ): Promise<{ id: string; name: string; stockLevel: number }> => {
-  const prisma = prismaInstance || getPrismaClient();
+  const db = getLocalDb();
+  const totalInventory = db
+    .prepare(
+      `
+        SELECT COALESCE(SUM(quantity), 0) AS total_quantity
+        FROM inventory
+        WHERE product_id = ? AND deleted_at IS NULL
+      `
+    )
+    .get(productId) as { total_quantity?: number };
 
-  const totalInventory = await prisma.inventory.aggregate({
-    where: { productId },
-    _sum: { quantity: true }
-  });
-
-  const newStockLevel = totalInventory._sum.quantity || 0;
-  return await updateProductStockLevel(productId, newStockLevel, prisma);
+  const newStockLevel = Number(totalInventory?.total_quantity ?? 0);
+  return await updateProductStockLevel(productId, newStockLevel);
 };
 
 export const categoryService = {
   findMany: async (options?: FindManyOptions) => {
-    const prisma = getPrismaClient();
-    const query: Record<string, unknown> = {
-      orderBy: { createdAt: "desc" }
-    };
+    const db = getLocalDb();
+    const selectKeys =
+      options?.select && Object.keys(options.select).filter((key) => options.select?.[key]);
+    const columns = selectKeys && selectKeys.length > 0 ? selectKeys.join(", ") : "*";
 
-    if (options?.select) {
-      query.select = options.select;
-    } else {
-      query.include = {
-        parentCategory: true,
-        subCategories: true
-      };
+    let sql = `SELECT ${columns} FROM categories WHERE deleted_at IS NULL ORDER BY created_at DESC`;
+    const params: Array<string | number> = [];
+    if (options?.pagination?.take) {
+      sql += " LIMIT ?";
+      params.push(options.pagination.take);
+    }
+    if (options?.pagination?.skip) {
+      sql += " OFFSET ?";
+      params.push(options.pagination.skip);
     }
 
-    applyPagination(query, options?.pagination);
-    return await prisma.category.findMany(query as any);
+    const rows = db.prepare(sql).all(...params);
+    if (options?.select) {
+      return rows;
+    }
+
+    const parentIds = rows
+      .map((row: any) => row.parent_category_id)
+      .filter((value: string | null) => Boolean(value));
+    const parentMap = new Map<string, any>();
+    if (parentIds.length > 0) {
+      const placeholders = parentIds.map(() => "?").join(", ");
+      const parents = db
+        .prepare(
+          `SELECT * FROM categories WHERE category_id IN (${placeholders}) AND deleted_at IS NULL`
+        )
+        .all(...parentIds);
+      for (const parent of parents) {
+        parentMap.set(parent.category_id, parent);
+      }
+    }
+
+    const subRows = db
+      .prepare("SELECT * FROM categories WHERE deleted_at IS NULL AND parent_category_id IS NOT NULL")
+      .all();
+    const subMap = new Map<string, any[]>();
+    for (const sub of subRows) {
+      const list = subMap.get(sub.parent_category_id) ?? [];
+      list.push(sub);
+      subMap.set(sub.parent_category_id, list);
+    }
+
+    const mapCategoryRow = (row: any) => ({
+      ...row,
+      id: row.category_id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      deletedAt: row.deleted_at,
+      parentCategory: row.parent_category_id
+        ? {
+            ...parentMap.get(row.parent_category_id),
+            id: row.parent_category_id,
+            createdAt: parentMap.get(row.parent_category_id)?.created_at,
+            updatedAt: parentMap.get(row.parent_category_id)?.updated_at,
+            deletedAt: parentMap.get(row.parent_category_id)?.deleted_at
+          }
+        : null,
+      subCategories: (subMap.get(row.category_id) ?? []).map((subRow: any) => ({
+        ...subRow,
+        id: subRow.category_id,
+        createdAt: subRow.created_at,
+        updatedAt: subRow.updated_at,
+        deletedAt: subRow.deleted_at
+      }))
+    });
+
+    return rows.map((row: any) => mapCategoryRow(row));
   },
 
   create: async (data: { name: string; parentCategoryId?: string }) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
 
-    // Check for duplicate name (case-insensitive for SQLite)
-    const existingCategories = await prisma.category.findMany({
-      where: {
-        name: {
-          contains: data.name
-        }
-      }
-    });
+    const existingCategories = db
+      .prepare(
+        `
+          SELECT name
+          FROM categories
+          WHERE deleted_at IS NULL AND LOWER(name) = LOWER(?)
+        `
+      )
+      .all(data.name);
 
-    const duplicateCategory = existingCategories.find(
-      (cat) => cat.name.toLowerCase() === data.name.toLowerCase()
-    );
-
-    if (duplicateCategory) {
+    if (existingCategories.length > 0) {
       throw new Error(`Category with name "${data.name}" already exists`);
     }
 
-    return await prisma.category.create({
-      data,
-      include: {
-        parentCategory: true,
-        subCategories: true
-      }
-    });
+    const categoryId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      category_id: categoryId,
+      name: data.name,
+      parent_category_id: data.parentCategoryId ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO categories (
+          category_id,
+          name,
+          parent_category_id,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.category_id,
+      row.name,
+      row.parent_category_id,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox("categories", row.category_id, "insert", row.version, row);
+
+    const parent = row.parent_category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(row.parent_category_id)
+      : null;
+
+    return {
+      ...row,
+      parentCategory: parent ?? null,
+      subCategories: []
+    };
   },
 
   update: async (id: string, data: { name: string; parentCategoryId?: string }) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
 
-    // Check for duplicate name (case-insensitive for SQLite, excluding current category)
-    const existingCategories = await prisma.category.findMany({
-      where: {
-        name: {
-          contains: data.name
-        },
-        NOT: {
-          id: id
-        }
-      }
-    });
+    const duplicate = db
+      .prepare(
+        `
+          SELECT category_id
+          FROM categories
+          WHERE deleted_at IS NULL
+            AND LOWER(name) = LOWER(?)
+            AND category_id != ?
+        `
+      )
+      .get(data.name, id);
 
-    const duplicateCategory = existingCategories.find(
-      (cat) => cat.name.toLowerCase() === data.name.toLowerCase()
-    );
-
-    if (duplicateCategory) {
+    if (duplicate) {
       throw new Error(`Category with name "${data.name}" already exists`);
     }
 
-    return await prisma.category.update({
-      where: { id },
-      data,
-      include: {
-        parentCategory: true,
-        subCategories: true
-      }
-    });
+    const existing = db
+      .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Category not found");
+    }
+
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      name: data.name ?? existing.name,
+      parent_category_id:
+        data.parentCategoryId !== undefined ? data.parentCategoryId : existing.parent_category_id,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE categories
+        SET name = ?, parent_category_id = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE category_id = ?
+      `
+    ).run(
+      row.name,
+      row.parent_category_id,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("categories", id, "update", row.version, row);
+
+    const parent = row.parent_category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(row.parent_category_id)
+      : null;
+    const subCategories = db
+      .prepare("SELECT * FROM categories WHERE parent_category_id = ? AND deleted_at IS NULL")
+      .all(row.category_id);
+
+    return {
+      ...row,
+      parentCategory: parent ?? null,
+      subCategories
+    };
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.category.delete({
-      where: { id }
-    });
+    const db = getLocalDb();
+    console.log(id,"id_category")
+    const existing = db
+      .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Category not found");
+    }
+
+    const deviceId = ensureDeviceId();
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+
+    db.prepare(
+      `
+        UPDATE categories
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE category_id = ?
+      `
+    ).run(deletedAt, version, deletedAt, deviceId, id);
+
+    const payload = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+    enqueueOutbox("categories", id, "delete", version, payload);
+
+    return payload;
   }
 };
 
@@ -468,43 +747,160 @@ export const productService = {
       return inFlight;
     }
 
-    const prisma = getPrismaClient();
-    const query: Record<string, unknown> = {
-      orderBy: buildProductOrderBy(options?.sort),
-      where: buildProductWhereClause(options?.filters)
-    };
+    const promise = (async () => {
+      const db = getLocalDb();
+      const rawRows = db
+        .prepare("SELECT * FROM products WHERE deleted_at IS NULL")
+        .all() as any[];
 
-    if (options?.select) {
-      query.select = options.select;
-    } else {
-      query.include = {
-        category: true,
-        images: true,
-        productTags: {
-          include: {
-            tag: true
+      const applyFilters = (rows: any[]): any[] => {
+        let filtered = rows;
+        const filters = options?.filters;
+
+        if (filters?.searchTerm) {
+          const term = filters.searchTerm.trim().toLowerCase();
+          if (term) {
+            filtered = filtered.filter((row) =>
+              [row.name, row.english_name, row.sku, row.barcode, row.brand, row.description]
+                .filter(Boolean)
+                .some((value: string) => value.toLowerCase().includes(term))
+            );
           }
         }
-      };
-    }
 
-    applyPagination(query, options?.pagination);
-    // console.log("[productService.findMany] hitting database", {
-    //   cacheKey,
-    //   filters: options?.filters,
-    //   sort: options?.sort,
-    //   pagination: options?.pagination
-    // });
-    const promise = prisma.product.findMany(query as any).then((rows) => {
-      productCache.set(cacheKey, {
-        data: rows as any[],
-        expiresAt: Date.now() + PRODUCT_CACHE_TTL_MS
-      });
-      productCacheInFlight.delete(cacheKey);
-      pruneProductCache();
-      // console.log("[productService.findMany] cached query result", { cacheKey, count: rows.length });
-      return rows as any[];
-    });
+        if (filters?.code) {
+          const code = filters.code.trim();
+          if (code) {
+            filtered = filtered.filter((row) => row.barcode === code || row.sku === code);
+          }
+        }
+
+        if (filters?.categoryId) {
+          filtered = filtered.filter((row) => row.category_id === filters.categoryId);
+        }
+
+        if (filters?.stockFilter === "inStock") {
+          filtered = filtered.filter((row) => Number(row.stock_level) > 0);
+        } else if (filters?.stockFilter === "outOfStock") {
+          filtered = filtered.filter((row) => Number(row.stock_level) === 0);
+        }
+
+        if (filters?.minPrice !== undefined || filters?.maxPrice !== undefined) {
+          filtered = filtered.filter((row) => {
+            const price = Number(row.price);
+            if (filters.minPrice !== undefined && price < filters.minPrice) {
+              return false;
+            }
+            if (filters.maxPrice !== undefined && price > filters.maxPrice) {
+              return false;
+            }
+            return true;
+          });
+        }
+
+        return filtered;
+      };
+
+      const applySort = (rows: any[]): any[] => {
+        const field = options?.sort?.field ?? "createdAt";
+        const direction = options?.sort?.direction ?? "desc";
+        const multiplier = direction === "asc" ? 1 : -1;
+
+        return [...rows].sort((a, b) => {
+          switch (field) {
+            case "name":
+              return a.name.localeCompare(b.name) * multiplier;
+            case "price":
+              return (Number(a.price) - Number(b.price)) * multiplier;
+            case "category":
+              return a.category_id.localeCompare(b.category_id) * multiplier;
+            case "stock":
+              return (Number(a.stock_level) - Number(b.stock_level)) * multiplier;
+            case "createdAt":
+            default:
+              return String(a.created_at).localeCompare(String(b.created_at)) * multiplier;
+          }
+        });
+      };
+
+      let rows = applyFilters(rawRows);
+      rows = applySort(rows);
+
+      if (options?.pagination?.skip) {
+        rows = rows.slice(options.pagination.skip);
+      }
+      if (options?.pagination?.take) {
+        rows = rows.slice(0, options.pagination.take);
+      }
+
+      if (options?.select) {
+        const selectKeys = Object.keys(options.select).filter((key) => options.select?.[key]);
+        return rows.map((row) => {
+          const selected: Record<string, any> = {};
+          for (const key of selectKeys) {
+            selected[key] = row[key];
+          }
+          return selected;
+        });
+      }
+
+      const productIds = rows.map((row) => row.product_id);
+      const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
+      const categoryMap = new Map(categories.map((cat: any) => [cat.category_id, cat]));
+
+      const images = productIds.length
+        ? db
+            .prepare(
+              `SELECT * FROM product_images WHERE deleted_at IS NULL AND product_id IN (${productIds
+                .map(() => "?")
+                .join(", ")})`
+            )
+            .all(...productIds)
+        : [];
+      const imagesMap = new Map<string, any[]>();
+      for (const image of images) {
+        const list = imagesMap.get(image.product_id) ?? [];
+        list.push(image);
+        imagesMap.set(image.product_id, list);
+      }
+
+      const tagMaps = productIds.length
+        ? db
+            .prepare(
+              `SELECT * FROM product_tag_map WHERE deleted_at IS NULL AND product_id IN (${productIds
+                .map(() => "?")
+                .join(", ")})`
+            )
+            .all(...productIds)
+        : [];
+      const tagIds = tagMaps.map((row: any) => row.tag_id);
+      const tags = tagIds.length
+        ? db
+            .prepare(
+              `SELECT * FROM product_tags WHERE deleted_at IS NULL AND tag_id IN (${tagIds
+                .map(() => "?")
+                .join(", ")})`
+            )
+            .all(...tagIds)
+        : [];
+      const tagMap = new Map(tags.map((tag: any) => [tag.tag_id, tag]));
+      const productTagMap = new Map<string, any[]>();
+      for (const mapping of tagMaps) {
+        const list = productTagMap.get(mapping.product_id) ?? [];
+        list.push({
+          ...mapping,
+          tag: tagMap.get(mapping.tag_id) ?? null
+        });
+        productTagMap.set(mapping.product_id, list);
+      }
+
+      return rows.map((row) => ({
+        ...row,
+        category: categoryMap.get(row.category_id) ?? null,
+        images: imagesMap.get(row.product_id) ?? [],
+        productTags: productTagMap.get(row.product_id) ?? []
+      }));
+    })();
 
     productCacheInFlight.set(cacheKey, promise);
     return promise.catch((error) => {
@@ -514,10 +910,45 @@ export const productService = {
     });
   },
   count: async (filters?: ProductFilters) => {
-    const prisma = getPrismaClient();
-    return await prisma.product.count({
-      where: buildProductWhereClause(filters)
+    const db = getLocalDb();
+    const rows = db
+      .prepare("SELECT * FROM products WHERE deleted_at IS NULL")
+      .all() as any[];
+    const filtered = rows.filter((row) => {
+      if (filters?.searchTerm) {
+        const term = filters.searchTerm.trim().toLowerCase();
+        if (
+          ![row.name, row.english_name, row.sku, row.barcode, row.brand, row.description]
+            .filter(Boolean)
+            .some((value: string) => value.toLowerCase().includes(term))
+        ) {
+          return false;
+        }
+      }
+      if (filters?.code) {
+        const code = filters.code.trim();
+        if (code && row.barcode !== code && row.sku !== code) {
+          return false;
+        }
+      }
+      if (filters?.categoryId && row.category_id !== filters.categoryId) {
+        return false;
+      }
+      if (filters?.stockFilter === "inStock" && Number(row.stock_level) <= 0) {
+        return false;
+      }
+      if (filters?.stockFilter === "outOfStock" && Number(row.stock_level) !== 0) {
+        return false;
+      }
+      if (filters?.minPrice !== undefined && Number(row.price) < filters.minPrice) {
+        return false;
+      }
+      if (filters?.maxPrice !== undefined && Number(row.price) > filters.maxPrice) {
+        return false;
+      }
+      return true;
     });
+    return filtered.length;
   },
 
   create: async (data: {
@@ -536,54 +967,108 @@ export const productService = {
     unitSize?: string;
     stockLevel?: number;
   }) => {
-    const prisma = getPrismaClient();
-
-    // Validate categoryId exists
-    if (data.categoryId) {
-      const categoryExists = await prisma.category.findUnique({
-        where: { id: data.categoryId }
-      });
-
-      if (!categoryExists) {
-        throw new Error(`Category with ID "${data.categoryId}" does not exist`);
-      }
+    const db = getLocalDb();
+    const category = db
+      .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+      .get(data.categoryId);
+    if (!category) {
+      throw new Error(`Category with ID "${data.categoryId}" does not exist`);
     }
 
-    // // Check for duplicate name (case-insensitive for SQLite)
-    // const existingProductsByName = await prisma.product.findMany({
-    //   where: {
-    //     name: {
-    //       contains: data.name
-    //     }
-    //   }
-    // });
+    const productId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      product_id: productId,
+      sku: data.sku ?? null,
+      barcode: data.barcode ?? null,
+      name: data.name,
+      english_name: data.englishName ?? null,
+      description: data.description ?? null,
+      brand: data.brand ?? null,
+      category_id: data.categoryId,
+      price: data.price,
+      cost_price: data.costPrice ?? 0,
+      discounted_price: data.discountedPrice ?? null,
+      wholesale: data.wholesale ?? null,
+      tax_inclusive_price: data.taxInclusivePrice ?? null,
+      tax_rate: data.taxRate ?? null,
+      unit_size: data.unitSize ?? null,
+      unit_type: data.unitType ?? null,
+      unit: data.unit ?? null,
+      stock_level:
+        data.stockLevel !== undefined ? validateAndFormatQuantity(data.stockLevel) : 0,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
 
-    // const duplicateProductByName = existingProductsByName.find(
-    //   (product) => product.name.toLowerCase() === data.name.toLowerCase()
-    // );
+    db.prepare(
+      `
+        INSERT INTO products (
+          product_id,
+          sku,
+          barcode,
+          name,
+          english_name,
+          description,
+          brand,
+          category_id,
+          price,
+          cost_price,
+          discounted_price,
+          wholesale,
+          tax_inclusive_price,
+          tax_rate,
+          unit_size,
+          unit_type,
+          unit,
+          stock_level,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.product_id,
+      row.sku,
+      row.barcode,
+      row.name,
+      row.english_name,
+      row.description,
+      row.brand,
+      row.category_id,
+      row.price,
+      row.cost_price,
+      row.discounted_price,
+      row.wholesale,
+      row.tax_inclusive_price,
+      row.tax_rate,
+      row.unit_size,
+      row.unit_type,
+      row.unit,
+      row.stock_level,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
 
-    // if (duplicateProductByName) {
-    //   throw new Error(`Product with name "${data.name}" already exists`);
-    // }
-
-    const createdProduct = await prisma.product.create({
-      data: {
-        ...data,
-        costPrice: data.costPrice ?? 0,
-        stockLevel: data.stockLevel !== undefined ? validateAndFormatQuantity(data.stockLevel) : 0
-      },
-      include: {
-        category: true,
-        images: true,
-        productTags: {
-          include: {
-            tag: true
-          }
-        }
-      }
-    });
+    enqueueOutbox("products", row.product_id, "insert", row.version, row);
     clearProductCache();
-    return createdProduct;
+
+    return {
+      ...row,
+      category,
+      images: [],
+      productTags: []
+    };
   },
 
   update: async (
@@ -605,160 +1090,252 @@ export const productService = {
       stockLevel?: number;
     }
   ) => {
-    const prisma = getPrismaClient();
-    console.log(data.stockLevel);
-    // // Check for duplicate name if provided (case-insensitive for SQLite, excluding current product)
-    // if (data.name) {
-    //   const existingProductsByName = await prisma.product.findMany({
-    //     where: {
-    //       name: {
-    //         contains: data.name
-    //       },
-    //       NOT: {
-    //         id: id
-    //       }
-    //     },
-    //     select: {
-    //       id: true,
-    //       name: true,
-    //       stockLevel: true
-    //     }
-    //   });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Product not found");
+    }
 
-    //   const duplicateProductByName = existingProductsByName.find(
-    //     (product) => product.name.toLowerCase() === data.name!.toLowerCase()
-    //   );
-
-    //   if (duplicateProductByName) {
-    //     throw new Error(`Product with name "${data.name}" already exists`);
-    //   }
-    // }
-
-    const updateData = { ...data };
-
-    const updatedProduct = await prisma.product.update({
-      where: { id },
-      data: updateData,
-      include: {
-        category: true,
-        images: true,
-        productTags: {
-          include: {
-            tag: true
-          }
-        }
+    if (data.categoryId) {
+      const categoryExists = db
+        .prepare("SELECT category_id FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+        .get(data.categoryId);
+      if (!categoryExists) {
+        throw new Error(`Category with ID "${data.categoryId}" does not exist`);
       }
-    });
+    }
+
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      sku: data.sku ?? existing.sku,
+      barcode: data.barcode ?? existing.barcode,
+      name: data.name ?? existing.name,
+      english_name: data.englishName ?? existing.english_name,
+      description: data.description ?? existing.description,
+      brand: data.brand ?? existing.brand,
+      category_id: data.categoryId ?? existing.category_id,
+      price: data.price ?? existing.price,
+      cost_price: data.costPrice ?? existing.cost_price,
+      discounted_price: data.discountedPrice ?? existing.discounted_price,
+      wholesale: data.wholesale ?? existing.wholesale,
+      tax_inclusive_price: data.taxInclusivePrice ?? existing.tax_inclusive_price,
+      tax_rate: data.taxRate ?? existing.tax_rate,
+      unit_size: data.unitSize ?? existing.unit_size,
+      unit_type: data.unitType ?? existing.unit_type,
+      unit: data.unit ?? existing.unit,
+      stock_level:
+        data.stockLevel !== undefined
+          ? validateAndFormatQuantity(data.stockLevel)
+          : existing.stock_level,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE products
+        SET sku = ?,
+            barcode = ?,
+            name = ?,
+            english_name = ?,
+            description = ?,
+            brand = ?,
+            category_id = ?,
+            price = ?,
+            cost_price = ?,
+            discounted_price = ?,
+            wholesale = ?,
+            tax_inclusive_price = ?,
+            tax_rate = ?,
+            unit_size = ?,
+            unit_type = ?,
+            unit = ?,
+            stock_level = ?,
+            version = ?,
+            updated_at = ?,
+            last_modified_by_device_id = ?
+        WHERE product_id = ?
+      `
+    ).run(
+      row.sku,
+      row.barcode,
+      row.name,
+      row.english_name,
+      row.description,
+      row.brand,
+      row.category_id,
+      row.price,
+      row.cost_price,
+      row.discounted_price,
+      row.wholesale,
+      row.tax_inclusive_price,
+      row.tax_rate,
+      row.unit_size,
+      row.unit_type,
+      row.unit,
+      row.stock_level,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("products", id, "update", row.version, row);
     clearProductCache();
-    return updatedProduct;
+
+    const category = db
+      .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+      .get(row.category_id);
+    const images = db
+      .prepare("SELECT * FROM product_images WHERE product_id = ? AND deleted_at IS NULL")
+      .all(id);
+    const tagMaps = db
+      .prepare("SELECT * FROM product_tag_map WHERE product_id = ? AND deleted_at IS NULL")
+      .all(id);
+    const tagIds = tagMaps.map((tag: any) => tag.tag_id);
+    const tags = tagIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM product_tags WHERE deleted_at IS NULL AND tag_id IN (${tagIds
+              .map(() => "?")
+              .join(", ")})`
+          )
+          .all(...tagIds)
+      : [];
+    const tagMap = new Map(tags.map((tag: any) => [tag.tag_id, tag]));
+
+    return {
+      ...row,
+      category: category ?? null,
+      images,
+      productTags: tagMaps.map((mapping: any) => ({
+        ...mapping,
+        tag: tagMap.get(mapping.tag_id) ?? null
+      }))
+    };
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!product) {
+      throw new Error("Product not found");
+    }
 
-    const deletedProduct = await prisma.$transaction(async (tx) => {
-      // Check if product exists
-      const product = await tx.product.findUnique({
-        where: { id },
-        include: {
-          inventory: true,
-          salesDetails: true,
-          purchaseOrderItems: true,
-          stockTransactions: true
-        }
-      });
+    const salesCount = db
+      .prepare(
+        "SELECT COUNT(1) AS count FROM sales_details WHERE product_id = ? AND deleted_at IS NULL"
+      )
+      .get(id);
+    if (Number(salesCount?.count ?? 0) > 0) {
+      throw new Error(
+        "Cannot delete product that has been used in sales transactions. " +
+          "This would compromise transaction history integrity."
+      );
+    }
 
-      if (!product) {
-        throw new Error("Product not found");
-      }
+    const poCount = db
+      .prepare(
+        "SELECT COUNT(1) AS count FROM purchase_order_items WHERE product_id = ? AND deleted_at IS NULL"
+      )
+      .get(id);
+    if (Number(poCount?.count ?? 0) > 0) {
+      throw new Error(
+        "Cannot delete product that has been used in purchase orders. " +
+          "This would compromise purchase history integrity."
+      );
+    }
 
-      // Check if product has been used in sales
-      if (product.salesDetails.length > 0) {
-        throw new Error(
-          "Cannot delete product that has been used in sales transactions. " +
-            "This would compromise transaction history integrity."
-        );
-      }
+    const deviceId = ensureDeviceId();
+    const deletedAt = nowIso();
+    const version = Number(product.version ?? 1) + 1;
 
-      // Check if product has been used in purchase orders
-      if (product.purchaseOrderItems.length > 0) {
-        throw new Error(
-          "Cannot delete product that has been used in purchase orders. " +
-            "This would compromise purchase history integrity."
-        );
-      }
+    db.prepare(
+      `
+        UPDATE products
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE product_id = ?
+      `
+    ).run(deletedAt, version, deletedAt, deviceId, id);
 
-      // Delete related records in proper order
+    const payload = {
+      ...product,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+    enqueueOutbox("products", id, "delete", version, payload);
 
-      // 1. Delete inventory records
-      if (product.inventory.length > 0) {
-        await tx.inventory.deleteMany({
-          where: { productId: id }
-        });
-      }
-
-      // 2. Delete stock transactions
-      if (product.stockTransactions.length > 0) {
-        await tx.stockTransaction.deleteMany({
-          where: { productId: id }
-        });
-      }
-
-      // 3. Delete product images
-      await tx.productImage.deleteMany({
-        where: { productId: id }
-      });
-
-      // 4. Delete product tag mappings
-      await tx.productTagMap.deleteMany({
-        where: { productId: id }
-      });
-
-      // 5. Delete inventory reports (if any)
-      await tx.reportInventorySummary.deleteMany({
-        where: { productId: id }
-      });
-
-      // 6. Finally delete the product
-      const deletedProduct = await tx.product.delete({
-        where: { id }
-      });
-
-      return deletedProduct;
-    });
     clearProductCache();
-    return deletedProduct;
+    return payload;
   }
 };
 
 export const employeeService = {
   findMany: async (options?: FindManyOptions) => {
-    const prisma = getPrismaClient();
-    const query: Record<string, unknown> = {
-      orderBy: { createdAt: "desc" }
-    };
+    const db = getLocalDb();
+    const selectKeys =
+      options?.select && Object.keys(options.select).filter((key) => options.select?.[key]);
+    const columns = selectKeys && selectKeys.length > 0 ? selectKeys.join(", ") : "*";
 
-    if (options?.select) {
-      query.select = options.select;
-    } else {
-      query.include = {
-        employeeRoles: {
-          include: {
-            role: {
-              select: {
-                id: true,
-                name: true,
-                description: true,
-                isSystem: true
-              }
-            }
-          }
-        }
-      };
+    let sql = `SELECT ${columns} FROM employee WHERE deleted_at IS NULL ORDER BY created_at DESC`;
+    const params: Array<string | number> = [];
+    if (options?.pagination?.take) {
+      sql += " LIMIT ?";
+      params.push(options.pagination.take);
+    }
+    if (options?.pagination?.skip) {
+      sql += " OFFSET ?";
+      params.push(options.pagination.skip);
     }
 
-    applyPagination(query, options?.pagination);
-    return await prisma.employee.findMany(query as any);
+    const rows = db.prepare(sql).all(...params);
+    if (options?.select) {
+      return rows;
+    }
+
+    const employeeIds = rows.map((row: any) => row.id);
+    const roleRows =
+      employeeIds.length > 0
+        ? db
+            .prepare(
+              `SELECT er.employee_id, er.role_id, r.role_id AS roleId, r.name, r.description, r.is_system
+               FROM employee_roles er
+               JOIN roles r ON r.role_id = er.role_id
+               WHERE er.deleted_at IS NULL AND r.deleted_at IS NULL AND er.employee_id IN (${employeeIds
+                 .map(() => "?")
+                 .join(", ")})`
+            )
+            .all(...employeeIds)
+        : [];
+
+    const roleMap = new Map<string, any[]>();
+    for (const row of roleRows) {
+      const list = roleMap.get(row.employee_id) ?? [];
+      list.push({
+        role: {
+          id: row.role_id,
+          name: row.name,
+          description: row.description,
+          isSystem: Boolean(row.is_system)
+        }
+      });
+      roleMap.set(row.employee_id, list);
+    }
+
+    return rows.map((row: any) => ({
+      ...row,
+      employeeRoles: roleMap.get(row.id) ?? []
+    }));
   },
 
   create: async (data: {
@@ -769,86 +1346,160 @@ export const employeeService = {
     address?: string;
     password_hash: string;
   }) => {
-    const prisma = getPrismaClient();
-    return await prisma.employee.create({
-      data,
-      include: {
-        employeeRoles: {
-          include: {
-            role: {
-              select: {
-                id: true,
-                name: true,
-                description: true,
-                isSystem: true
-              }
-            }
-          }
-        }
-      }
-    });
+    const db = getLocalDb();
+    const existingEmail = db
+      .prepare("SELECT id FROM employee WHERE email = ? AND deleted_at IS NULL")
+      .get(data.email);
+    if (existingEmail) {
+      throw new Error(`Employee with email "${data.email}" already exists`);
+    }
+
+    const employeeId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      id: employeeId,
+      employee_id: data.employee_id,
+      name: data.name,
+      role: data.role,
+      email: data.email,
+      address: data.address ?? null,
+      password_hash: data.password_hash,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO employee (
+          id,
+          employee_id,
+          name,
+          role,
+          email,
+          address,
+          password_hash,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.id,
+      row.employee_id,
+      row.name,
+      row.role,
+      row.email,
+      row.address,
+      row.password_hash,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox("employee", row.id, "insert", row.version, row);
+
+    return {
+      ...row,
+      employeeRoles: []
+    };
   },
 
   // New method for creating employee with role ID
-    createWithRole: async (data: {
-      employee_id: string;
-      name: string;
-      email: string;
-      address?: string;
-      password_hash: string;
-      roleId?: string;
-      tenantId?: string;
-    }) => {
-      const prisma = getPrismaClient();
+  createWithRole: async (data: {
+    employee_id: string;
+    name: string;
+    email: string;
+    address?: string;
+    password_hash: string;
+    roleId?: string;
+    tenantId?: string;
+  }) => {
+    const db = getLocalDb();
+    const roleRecord = data.roleId
+      ? db
+          .prepare("SELECT role_id, name, description, is_system FROM roles WHERE role_id = ? AND deleted_at IS NULL")
+          .get(data.roleId)
+      : null;
+    const assignedRoleName = roleRecord?.name ?? "";
 
-      const employeeWithRoles = await prisma.$transaction(async (tx) => {
-        const roleRecord =
-          data.roleId
-            ? await tx.role.findUnique({ where: { id: data.roleId }, select: { name: true } })
-            : null;
-        const assignedRoleName = roleRecord?.name ?? "";
-
-        // Create employee with the assigned role name stored in the legacy role column
-        const employee = await tx.employee.create({
-          data: {
-            employee_id: data.employee_id,
-            name: data.name,
-            role: assignedRoleName,
-            email: data.email,
-            address: data.address,
-            password_hash: data.password_hash
-          }
-        });
-
-      // Assign role if provided
-        if (data.roleId) {
-          await tx.employeeRole.create({
-            data: {
-              employeeId: employee.id,
-              roleId: data.roleId
-            }
-          });
-        }
-
-      // Return employee with role relationship
-      return await tx.employee.findUnique({
-        where: { id: employee.id },
-        include: {
-          employeeRoles: {
-            include: {
-              role: {
-                select: {
-                  id: true,
-                  name: true,
-                  description: true,
-                  isSystem: true
-                }
-              }
-            }
-          }
-        }
-      });
+    const employee = await employeeService.create({
+      employee_id: data.employee_id,
+      name: data.name,
+      role: assignedRoleName,
+      email: data.email,
+      address: data.address,
+      password_hash: data.password_hash
     });
+
+    let employeeRoles: any[] = [];
+    if (data.roleId) {
+      const timestamp = nowIso();
+      const row = {
+        employee_id: employee.id,
+        role_id: data.roleId,
+        assigned_at: timestamp,
+        assigned_by: null,
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp,
+        deleted_at: null,
+        last_modified_by_device_id: ensureDeviceId()
+      };
+      db.prepare(
+        `
+          INSERT INTO employee_roles (
+            employee_id,
+            role_id,
+            assigned_at,
+            assigned_by,
+            version,
+            created_at,
+            updated_at,
+            deleted_at,
+            last_modified_by_device_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      ).run(
+        row.employee_id,
+        row.role_id,
+        row.assigned_at,
+        row.assigned_by,
+        row.version,
+        row.created_at,
+        row.updated_at,
+        row.deleted_at,
+        row.last_modified_by_device_id
+      );
+
+      enqueueOutbox(
+        "employee_roles",
+        buildCompositeRowId({ employee_id: row.employee_id, role_id: row.role_id }),
+        "insert",
+        row.version,
+        row
+      );
+
+      employeeRoles = [
+        {
+          role: {
+            id: roleRecord.role_id,
+            name: roleRecord.name,
+            description: roleRecord.description,
+            isSystem: Boolean(roleRecord.is_system)
+          }
+        }
+      ];
+    }
 
     await upsertTenantUser({
       tenantId: data.tenantId,
@@ -856,7 +1507,10 @@ export const employeeService = {
       passwordHash: data.password_hash
     });
 
-    return employeeWithRoles;
+    return {
+      ...employee,
+      employeeRoles
+    };
   },
 
   update: async (
@@ -869,25 +1523,88 @@ export const employeeService = {
       password_hash?: string;
     }
   ) => {
-    const prisma = getPrismaClient();
-    return await prisma.employee.update({
-      where: { id },
-      data,
-      include: {
-        employeeRoles: {
-          include: {
-            role: {
-              select: {
-                id: true,
-                name: true,
-                description: true,
-                isSystem: true
-              }
-            }
-          }
-        }
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM employee WHERE id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Employee not found");
+    }
+
+    if (data.email) {
+      const duplicate = db
+        .prepare("SELECT id FROM employee WHERE email = ? AND id != ? AND deleted_at IS NULL")
+        .get(data.email, id);
+      if (duplicate) {
+        throw new Error(`Employee with email "${data.email}" already exists`);
       }
-    });
+    }
+
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      employee_id: data.employee_id ?? existing.employee_id,
+      name: data.name ?? existing.name,
+      role: data.role ?? existing.role,
+      email: data.email ?? existing.email,
+      address: data.address ?? existing.address,
+      password_hash: data.password_hash ?? existing.password_hash,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE employee
+        SET employee_id = ?,
+            name = ?,
+            role = ?,
+            email = ?,
+            address = ?,
+            password_hash = ?,
+            version = ?,
+            updated_at = ?,
+            last_modified_by_device_id = ?
+        WHERE id = ?
+      `
+    ).run(
+      row.employee_id,
+      row.name,
+      row.role,
+      row.email,
+      row.address,
+      row.password_hash,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("employee", id, "update", row.version, row);
+
+    const roleRows = db
+      .prepare(
+        `SELECT er.employee_id, er.role_id, r.name, r.description, r.is_system
+         FROM employee_roles er
+         JOIN roles r ON r.role_id = er.role_id
+         WHERE er.deleted_at IS NULL AND r.deleted_at IS NULL AND er.employee_id = ?`
+      )
+      .all(id);
+
+    return {
+      ...row,
+      employeeRoles: roleRows.map((row: any) => ({
+        role: {
+          id: row.role_id,
+          name: row.name,
+          description: row.description,
+          isSystem: Boolean(row.is_system)
+        }
+      }))
+    };
   },
 
   // New method for updating employee with role ID
@@ -904,86 +1621,153 @@ export const employeeService = {
       previousEmail?: string;
     }
   ) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM employee WHERE id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Employee not found");
+    }
 
-    const employeeWithRoles = await prisma.$transaction(async (tx) => {
-      // Update employee basic info
-      const updatePayload: Record<string, unknown> = {};
-
-      if (data.employee_id !== undefined) {
-        updatePayload.employee_id = data.employee_id;
+    if (data.email) {
+      const duplicate = db
+        .prepare("SELECT id FROM employee WHERE email = ? AND id != ? AND deleted_at IS NULL")
+        .get(data.email, id);
+      if (duplicate) {
+        throw new Error(`Employee with email "${data.email}" already exists`);
       }
-      if (data.name !== undefined) {
-        updatePayload.name = data.name;
+    }
+
+    let assignedRoleName = existing.role;
+    if (data.roleId !== undefined) {
+      if (data.roleId) {
+        const roleRecord = db
+          .prepare("SELECT name FROM roles WHERE role_id = ? AND deleted_at IS NULL")
+          .get(data.roleId);
+        assignedRoleName = roleRecord?.name ?? "";
+      } else {
+        assignedRoleName = "";
       }
-      if (data.email !== undefined) {
-        updatePayload.email = data.email;
-      }
-      if (data.address !== undefined) {
-        updatePayload.address = data.address;
-      }
-      if (data.password_hash !== undefined) {
-        updatePayload.password_hash = data.password_hash;
+    }
+
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      employee_id: data.employee_id ?? existing.employee_id,
+      name: data.name ?? existing.name,
+      role: assignedRoleName,
+      email: data.email ?? existing.email,
+      address: data.address ?? existing.address,
+      password_hash: data.password_hash ?? existing.password_hash,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE employee
+        SET employee_id = ?, name = ?, role = ?, email = ?, address = ?, password_hash = ?,
+            version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE id = ?
+      `
+    ).run(
+      row.employee_id,
+      row.name,
+      row.role,
+      row.email,
+      row.address,
+      row.password_hash,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("employee", id, "update", row.version, row);
+
+    if (data.roleId !== undefined) {
+      const existingRoles = db
+        .prepare("SELECT * FROM employee_roles WHERE employee_id = ? AND deleted_at IS NULL")
+        .all(id);
+      for (const roleRow of existingRoles) {
+        const deletedAt = nowIso();
+        const roleVersion = Number(roleRow.version ?? 1) + 1;
+        db.prepare(
+          `
+            UPDATE employee_roles
+            SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+            WHERE employee_id = ? AND role_id = ?
+          `
+        ).run(deletedAt, roleVersion, deletedAt, deviceId, roleRow.employee_id, roleRow.role_id);
+
+        const payload = {
+          ...roleRow,
+          deleted_at: deletedAt,
+          version: roleVersion,
+          updated_at: deletedAt,
+          last_modified_by_device_id: deviceId
+        };
+        enqueueOutbox(
+          "employee_roles",
+          buildCompositeRowId({ employee_id: roleRow.employee_id, role_id: roleRow.role_id }),
+          "delete",
+          roleVersion,
+          payload
+        );
       }
 
-      const roleChangeRequested = data.roleId !== undefined;
-      let assignedRoleName: string | undefined;
+      if (data.roleId) {
+        const timestamp = nowIso();
+        const roleInsert = {
+          employee_id: id,
+          role_id: data.roleId,
+          assigned_at: timestamp,
+          assigned_by: null,
+          version: 1,
+          created_at: timestamp,
+          updated_at: timestamp,
+          deleted_at: null,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            INSERT INTO employee_roles (
+              employee_id,
+              role_id,
+              assigned_at,
+              assigned_by,
+              version,
+              created_at,
+              updated_at,
+              deleted_at,
+              last_modified_by_device_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        ).run(
+          roleInsert.employee_id,
+          roleInsert.role_id,
+          roleInsert.assigned_at,
+          roleInsert.assigned_by,
+          roleInsert.version,
+          roleInsert.created_at,
+          roleInsert.updated_at,
+          roleInsert.deleted_at,
+          roleInsert.last_modified_by_device_id
+        );
 
-      if (roleChangeRequested) {
-        if (data.roleId) {
-          const roleRecord = await tx.role.findUnique({
-            where: { id: data.roleId },
-            select: { name: true }
-          });
-          assignedRoleName = roleRecord?.name ?? "";
-        } else {
-          assignedRoleName = "";
-        }
-        updatePayload.role = assignedRoleName;
+        enqueueOutbox(
+          "employee_roles",
+          buildCompositeRowId({ employee_id: roleInsert.employee_id, role_id: roleInsert.role_id }),
+          "insert",
+          roleInsert.version,
+          roleInsert
+        );
       }
-
-      await tx.employee.update({
-        where: { id },
-        data: updatePayload
-      });
-
-      // Handle role assignment if provided
-      if (data.roleId !== undefined) {
-        // Remove all existing roles
-        await tx.employeeRole.deleteMany({
-          where: { employeeId: id }
-        });
-
-        // Assign new role if not null
-        if (data.roleId) {
-          await tx.employeeRole.create({
-            data: {
-              employeeId: id,
-              roleId: data.roleId
-            }
-          });
-        }
-      }
-
-      // Return updated employee with role relationship
-      return await tx.employee.findUnique({
-        where: { id },
-        include: {
-          employeeRoles: {
-            include: {
-              role: {
-                select: {
-                  id: true,
-                  name: true,
-                  description: true,
-                  isSystem: true
-                }
-              }
-            }
-          }
-        }
-      });
-    });
+    }
 
     await upsertTenantUser({
       tenantId: data.tenantId,
@@ -992,110 +1776,139 @@ export const employeeService = {
       previousEmail: data.previousEmail
     });
 
-    return employeeWithRoles;
+    const roles = db
+      .prepare(
+        `
+          SELECT er.employee_id, er.role_id, r.name, r.description, r.is_system
+          FROM employee_roles er
+          JOIN roles r ON r.role_id = er.role_id
+          WHERE er.employee_id = ? AND er.deleted_at IS NULL AND r.deleted_at IS NULL
+        `
+      )
+      .all(id);
+
+    return {
+      ...row,
+      employeeRoles: roles.map((role: any) => ({
+        role: {
+          id: role.role_id,
+          name: role.name,
+          description: role.description,
+          isSystem: Boolean(role.is_system)
+        }
+      }))
+    };
   },
 
   // Assign role to employee
   assignRole: async (employeeId: string, roleId: string) => {
-    const prisma = getPrismaClient();
-
-    // Remove existing roles first (single role system)
-    await prisma.employeeRole.deleteMany({
-      where: { employeeId }
-    });
-
-    const roleRecord = await prisma.role.findUnique({
-      where: { id: roleId },
-      select: { name: true }
-    });
-    const assignedRoleName = roleRecord?.name ?? "";
-
-    await prisma.employee.update({
-      where: { id: employeeId },
-      data: { role: assignedRoleName }
-    });
-
-    // Assign new role
-    return await prisma.employeeRole.create({
-      data: {
-        employeeId,
-        roleId
-      },
-      include: {
-        role: true,
-        employee: true
-      }
-    });
+    return await employeeService.updateWithRole(employeeId, { roleId });
   },
 
   // Remove role from employee
   removeRole: async (employeeId: string, roleId: string) => {
-    const prisma = getPrismaClient();
-    const deletedRole = await prisma.employeeRole.delete({
-      where: {
-        employeeId_roleId: {
-          employeeId,
-          roleId
-        }
-      }
-    });
-
-    const remainingRole = await prisma.employeeRole.findFirst({
-      where: { employeeId },
-      include: {
-        role: {
-          select: { name: true }
-        }
-      }
-    });
-
-    const nextRoleName = remainingRole?.role?.name ?? "";
-    await prisma.employee.update({
-      where: { id: employeeId },
-      data: { role: nextRoleName }
-    });
-
-    return deletedRole;
+    const updated = await employeeService.updateWithRole(employeeId, { roleId: null });
+    const deleted = {
+      employeeId,
+      roleId
+    };
+    return {
+      ...deleted,
+      employee: updated,
+      role: updated.employeeRoles?.[0]?.role ?? null
+    };
   },
 
   // Get employee's role
   getEmployeeRole: async (employeeId: string) => {
-    const prisma = getPrismaClient();
-    const employeeRole = await prisma.employeeRole.findFirst({
-      where: { employeeId },
-      include: {
-        role: true
-      }
-    });
-    return employeeRole?.role || null;
+    const db = getLocalDb();
+    const role = db
+      .prepare(
+        `
+          SELECT r.role_id, r.name, r.description, r.is_system
+          FROM employee_roles er
+          JOIN roles r ON r.role_id = er.role_id
+          WHERE er.employee_id = ? AND er.deleted_at IS NULL AND r.deleted_at IS NULL
+          LIMIT 1
+        `
+      )
+      .get(employeeId);
+    if (!role) {
+      return null;
+    }
+    return {
+      id: role.role_id,
+      name: role.name,
+      description: role.description,
+      isSystem: Boolean(role.is_system)
+    };
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.employee.delete({
-      where: { id },
-      select: {
-        id: true,
-        employee_id: true,
-        name: true,
-        role: true,
-        email: true
-      }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM employee WHERE id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Employee not found");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    db.prepare(
+      `
+        UPDATE employee
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE id = ?
+      `
+    ).run(deletedAt, version, deletedAt, deviceId, id);
+
+    const payload = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+    enqueueOutbox("employee", id, "delete", version, payload);
+
+    return payload;
   },
 
   findByEmail: async (email: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.employee.findUnique({
-      where: { email }
-    });
+    const db = getLocalDb();
+    return db
+      .prepare("SELECT * FROM employee WHERE email = ? AND deleted_at IS NULL")
+      .get(email);
+  },
+
+  findByEmailOnline: async (email: string, schemaName: string) => {
+    const normalizedSchema = schemaName?.trim();
+    if (!normalizedSchema) {
+      throw new Error("Missing schemaName for online lookup");
+    }
+
+    const prisma = getTenantPrismaClient(normalizedSchema);
+    const rows = (await prisma.$queryRawUnsafe(
+      `
+        SELECT *
+        FROM employee
+        WHERE email = $1
+          AND deleted_at IS NULL
+        LIMIT 1
+      `,
+      email
+    )) as any[];
+
+    return rows[0] ?? null;
   },
 
   findByEmployeeId: async (employee_id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.employee.findUnique({
-      where: { employee_id }
-    });
+    const db = getLocalDb();
+    return db
+      .prepare("SELECT * FROM employee WHERE employee_id = ? AND deleted_at IS NULL")
+      .get(employee_id);
   },
 
   verifyPassword: async (password: string, hash: string): Promise<boolean> => {
@@ -1129,83 +1942,129 @@ export const salesInvoiceService = {
     },
     options?: FindManyOptions
   ) => {
-    const prisma = getPrismaClient();
-
-    const whereClause: Record<string, unknown> = {};
+    const db = getLocalDb();
+    let rows = db
+      .prepare("SELECT * FROM sales_invoices WHERE deleted_at IS NULL ORDER BY date DESC")
+      .all() as any[];
 
     if (filters?.dateFrom || filters?.dateTo) {
-      whereClause.date = {};
-      if (filters.dateFrom) {
-        const fromDate = new Date(filters.dateFrom + "T00:00:00");
-        (whereClause.date as Record<string, Date>).gte = fromDate;
-      }
-      if (filters.dateTo) {
-        const toDate = new Date(filters.dateTo + "T23:59:59.999");
-        (whereClause.date as Record<string, Date>).lte = toDate;
-      }
+      const from = filters?.dateFrom ? new Date(filters.dateFrom + "T00:00:00") : null;
+      const to = filters?.dateTo ? new Date(filters.dateTo + "T23:59:59.999") : null;
+      rows = rows.filter((row) => {
+        const date = new Date(row.date);
+        if (from && date < from) return false;
+        if (to && date > to) return false;
+        return true;
+      });
     }
 
     if (filters?.employeeId && filters.employeeId !== "all") {
-      whereClause.employeeId = filters.employeeId;
+      rows = rows.filter((row) => row.employee_id === filters.employeeId);
     }
 
     if (filters?.customerId && filters.customerId !== "all") {
-      whereClause.customerId = filters.customerId;
+      rows = rows.filter((row) => row.customer_id === filters.customerId);
     }
 
     if (filters?.paymentMode && filters.paymentMode !== "all") {
-      whereClause.paymentMode = filters.paymentMode;
+      rows = rows.filter((row) => row.payment_mode === filters.paymentMode);
     }
 
-    const query: Record<string, unknown> = {
-      where: whereClause,
-      orderBy: { date: "desc" }
-    };
+    if (options?.pagination?.skip) {
+      rows = rows.slice(options.pagination.skip);
+    }
+    if (options?.pagination?.take) {
+      rows = rows.slice(0, options.pagination.take);
+    }
 
     if (options?.select) {
-      query.select = options.select;
-    } else {
-      query.include = {
-        customer: true,
-        employee: true,
-        payments: {
-          include: {
-            employee: true
-          },
-          orderBy: { createdAt: "desc" }
-        },
-        salesDetails: {
-          include: {
-            product: {
-              include: {
-                category: true
-              }
-            },
-            customProduct: true
-          }
+      const selectKeys = Object.keys(options.select).filter((key) => options.select?.[key]);
+      return rows.map((row) => {
+        const selected: Record<string, any> = {};
+        for (const key of selectKeys) {
+          selected[key] = row[key];
         }
-      };
+        return selected;
+      });
     }
 
-    applyPagination(query, options?.pagination);
+    const customerIds = rows.map((row) => row.customer_id).filter(Boolean);
+    const employeeIds = rows.map((row) => row.employee_id).filter(Boolean);
+    const customers = customerIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM customers WHERE customer_id IN (${customerIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...customerIds)
+      : [];
+    const employees = employeeIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM employee WHERE id IN (${employeeIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...employeeIds)
+      : [];
+    const customerMap = new Map(customers.map((row) => [row.customer_id, row]));
+    const employeeMap = new Map(employees.map((row) => [row.id, row]));
 
-    const invoices = await prisma.salesInvoice.findMany(query as any);
+    const invoiceIds = rows.map((row) => row.invoice_id);
+    const payments = invoiceIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM payments WHERE invoice_id IN (${invoiceIds.map(() => "?").join(", ")}) AND deleted_at IS NULL ORDER BY created_at DESC`
+          )
+          .all(...invoiceIds)
+      : [];
+    const paymentMap = new Map();
+    for (const payment of payments) {
+      const list = paymentMap.get(payment.invoice_id) ?? [];
+      list.push(payment);
+      paymentMap.set(payment.invoice_id, list);
+    }
 
-    // Recalculate outstanding balance for each invoice based on payments
-    return invoices.map((invoice) => {
-      if (
-        !Array.isArray((invoice as any).payments) ||
-        typeof (invoice as any).totalAmount !== "number"
-      ) {
-        return invoice;
-      }
+    const salesDetails = invoiceIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM sales_details WHERE invoice_id IN (${invoiceIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...invoiceIds)
+      : [];
+    const detailMap = new Map();
+    for (const detail of salesDetails) {
+      const list = detailMap.get(detail.invoice_id) ?? [];
+      list.push(detail);
+      detailMap.set(detail.invoice_id, list);
+    }
 
-      const totalPaid = (invoice as any).payments.reduce(
-        (sum: number, payment: { amount: number }) => sum + payment.amount,
+    const productIds = salesDetails.map((row) => row.product_id).filter(Boolean);
+    const products = productIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM products WHERE product_id IN (${productIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...productIds)
+      : [];
+    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
+    const productMap = new Map(products.map((row) => [row.product_id, row]));
+    const categoryMap = new Map(categories.map((row) => [row.category_id, row]));
+
+    const customProductIds = salesDetails.map((row) => row.custom_product_id).filter(Boolean);
+    const customProducts = customProductIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM custom_products WHERE custom_product_id IN (${customProductIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...customProductIds)
+      : [];
+    const customProductMap = new Map(customProducts.map((row) => [row.custom_product_id, row]));
+
+    return rows.map((invoice) => {
+      const paymentsForInvoice = paymentMap.get(invoice.invoice_id) ?? [];
+      const totalPaid = paymentsForInvoice.reduce(
+        (sum: number, payment: any) => sum + Number(payment.amount),
         0
       );
-      const outstandingBalance = (invoice as any).totalAmount - totalPaid;
-
+      const outstandingBalance = Number(invoice.total_amount) - totalPaid;
       let paymentStatus = "paid";
       if (outstandingBalance > 0) {
         paymentStatus = totalPaid > 0 ? "partial" : "unpaid";
@@ -1213,6 +2072,24 @@ export const salesInvoiceService = {
 
       return {
         ...invoice,
+        customer: invoice.customer_id ? customerMap.get(invoice.customer_id) ?? null : null,
+        employee: invoice.employee_id ? employeeMap.get(invoice.employee_id) ?? null : null,
+        payments: paymentsForInvoice.map((payment: any) => ({
+          ...payment,
+          employee: payment.employee_id ? employeeMap.get(payment.employee_id) ?? null : null
+        })),
+        salesDetails: (detailMap.get(invoice.invoice_id) ?? []).map((detail: any) => ({
+          ...detail,
+          product: detail.product_id
+            ? {
+                ...productMap.get(detail.product_id),
+                category: categoryMap.get(productMap.get(detail.product_id)?.category_id) ?? null
+              }
+            : null,
+          customProduct: detail.custom_product_id
+            ? customProductMap.get(detail.custom_product_id) ?? null
+            : null
+        })),
         outstandingBalance,
         paymentStatus
       };
@@ -1220,49 +2097,8 @@ export const salesInvoiceService = {
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    const invoice = await prisma.salesInvoice.findUnique({
-      where: { id },
-      include: {
-        customer: true,
-        employee: true,
-        payments: {
-          include: {
-            employee: true
-          },
-          orderBy: { createdAt: "desc" }
-        },
-        salesDetails: {
-          include: {
-            product: {
-              include: {
-                category: true
-              }
-            },
-            customProduct: true
-          }
-        }
-      }
-    });
-
-    // Recalculate outstanding balance based on payments
-    if (invoice) {
-      const totalPaid = invoice.payments.reduce((sum, payment) => sum + payment.amount, 0);
-      const outstandingBalance = invoice.totalAmount - totalPaid;
-
-      let paymentStatus = "paid";
-      if (outstandingBalance > 0) {
-        paymentStatus = totalPaid > 0 ? "partial" : "unpaid";
-      }
-
-      return {
-        ...invoice,
-        outstandingBalance,
-        paymentStatus
-      };
-    }
-
-    return invoice;
+    const rows = await salesInvoiceService.getFiltered(undefined, undefined);
+    return (rows as any[]).find((row) => row.invoice_id === id) ?? null;
   },
 
   create: async (data: {
@@ -1286,340 +2122,634 @@ export const salesInvoiceService = {
       unit?: string;
     }>;
   }) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const deviceId = ensureDeviceId();
 
-    const invoice = await prisma.$transaction(
-      async (tx) => {
-        // Validate employee exists, use default admin if not
-        let validEmployeeId = data.employeeId;
-        console.log("Validating employee ID:", data.employeeId);
-        const employeeExists = await tx.employee.findUnique({
-          where: { id: data.employeeId }
-        });
-        console.log("Employee exists:", !!employeeExists);
+    let validEmployeeId = data.employeeId;
+    const employeeExists = db
+      .prepare("SELECT id FROM employee WHERE id = ? AND deleted_at IS NULL")
+      .get(data.employeeId);
 
-        if (!employeeExists) {
-          // Try to find the default admin employee
-          const defaultAdmin = await tx.employee.findFirst({
-            where: { employee_id: "ADMIN001" }
-          });
-          console.log("Default admin found:", !!defaultAdmin);
-
-          if (defaultAdmin) {
-            validEmployeeId = defaultAdmin.id;
-            console.log("Using default admin ID:", validEmployeeId);
-          } else {
-            // If no default admin exists, find any employee
-            const anyEmployee = await tx.employee.findFirst();
-            console.log("Any employee found:", !!anyEmployee);
-            if (anyEmployee) {
-              validEmployeeId = anyEmployee.id;
-              console.log("Using any employee ID:", validEmployeeId);
-            } else {
-              throw new Error("No employees found in the system. Please create an employee first.");
-            }
-          }
+    if (!employeeExists) {
+      const defaultAdmin = db
+        .prepare("SELECT id FROM employee WHERE employee_id = 'ADMIN001' AND deleted_at IS NULL")
+        .get();
+      if (defaultAdmin) {
+        validEmployeeId = defaultAdmin.id;
+      } else {
+        const anyEmployee = db
+          .prepare("SELECT id FROM employee WHERE deleted_at IS NULL LIMIT 1")
+          .get();
+        if (anyEmployee) {
+          validEmployeeId = anyEmployee.id;
+        } else {
+          throw new Error("No employees found in the system. Please create an employee first.");
         }
-
-        // Validate customer exists if provided
-        if (data.customerId) {
-          const customerExists = await tx.customer.findUnique({
-            where: { id: data.customerId }
-          });
-          console.log("Customer exists:", !!customerExists);
-
-          if (!customerExists) {
-            // Remove invalid customer reference
-            data.customerId = undefined;
-            console.log("Removed invalid customer reference");
-          }
-        }
-
-        // Generate invoice number: INV-1000, INV-1001, etc.
-        const lastInvoice = await tx.salesInvoice.findFirst({
-          orderBy: { createdAt: "desc" },
-          select: { id: true }
-        });
-
-        let nextInvoiceNumber = 1000; // Starting number
-        console.log("Last invoice:", lastInvoice);
-        if (lastInvoice) {
-          // Extract the number from the last invoice ID if it follows the pattern
-          const lastIdMatch = lastInvoice.id.match(/^INV-(\d+)$/);
-          if (lastIdMatch) {
-            nextInvoiceNumber = parseInt(lastIdMatch[1]) + 1;
-          }
-        }
-
-        const invoiceNumber = `INV-${nextInvoiceNumber}`;
-        console.log(data);
-        // Create the sales invoice with the generated invoice number
-        const productIds = Array.from(
-          new Set(
-            data.salesDetails
-              .filter((detail) => detail.productId)
-              .map((detail) => detail.productId!)
-          )
-        );
-        const productCostMap = new Map<string, number>();
-
-        if (productIds.length > 0) {
-          const productCosts = await tx.product.findMany({
-            where: { id: { in: productIds } },
-            select: { id: true, costPrice: true }
-          });
-
-          productCosts.forEach((product) => {
-            productCostMap.set(product.id, product.costPrice ?? 0);
-          });
-        }
-
-        const invoice = await tx.salesInvoice.create({
-          data: {
-            id: invoiceNumber, // Use the generated invoice number as the ID
-            customerId: data.customerId,
-            employeeId: validEmployeeId,
-            subTotal: data.subTotal,
-            totalAmount: data.totalAmount,
-            paymentMode: data.paymentMode,
-            taxAmount: data.taxAmount || 0,
-            discountAmount: data.discountAmount || 0,
-            amountReceived: data.amountReceived,
-            outstandingBalance: data.outstandingBalance || 0,
-            paymentStatus: data.paymentStatus || "paid",
-            salesDetails: {
-              create: data.salesDetails.map((detail) => ({
-                productId: detail.productId || undefined,
-                customProductId: detail.customProductId || undefined,
-                quantity: detail.quantity,
-                unitPrice: detail.unitPrice,
-                taxRate: detail.taxRate || 0,
-                unit: detail.unit || "pcs",
-                originalPrice: detail.originalPrice,
-                costPrice: detail.productId ? (productCostMap.get(detail.productId) ?? 0) : 0
-              }))
-            }
-          },
-          include: {
-            customer: true,
-            employee: true,
-            salesDetails: {
-              include: {
-                product: true,
-                customProduct: true
-              }
-            }
-          }
-        });
-
-        // Update product stock levels and inventory (only for regular products, not custom products)
-        for (const detail of data.salesDetails) {
-          // Skip custom products
-          if (detail.customProductId || !detail.productId) {
-            continue;
-          }
-
-          // Format quantity to 3 decimal places
-          const formattedQuantity = validateAndFormatQuantity(detail.quantity);
-
-          // Update Product.stockLevel
-          if (detail.productId) {
-            await tx.product.update({
-              where: { id: detail.productId },
-              data: {
-                stockLevel: {
-                  decrement: formattedQuantity
-                }
-              }
-            });
-          }
-
-          // Update Inventory.quantity
-          const inventory = await tx.inventory.findFirst({
-            where: { productId: detail.productId }
-          });
-
-          if (inventory) {
-            await tx.inventory.update({
-              where: { id: inventory.id },
-              data: {
-                quantity: {
-                  decrement: formattedQuantity
-                }
-              }
-            });
-          } else {
-            // If no inventory record exists, create one with 0 quantity (since we're selling)
-            await tx.inventory.create({
-              data: {
-                productId: detail.productId,
-                quantity: Math.max(0, -formattedQuantity), // Ensure non-negative
-                reorderLevel: 5 // Default reorder level
-              }
-            });
-          }
-
-          // Create stock transaction record
-          await tx.stockTransaction.create({
-            data: {
-              productId: detail.productId,
-              type: "OUT",
-              changeQty: -formattedQuantity,
-              reason: "Sale",
-              relatedInvoiceId: invoice.id
-            }
-          });
-        }
-
-        // Update customer loyalty points if customer exists
-        if (data.customerId) {
-          const pointsToAdd = Math.floor(data.totalAmount / 10); // 1 point per Rs 10 spent
-          await tx.customer.update({
-            where: { id: data.customerId },
-            data: {
-              loyaltyPoints: {
-                increment: pointsToAdd
-              }
-            }
-          });
-
-          // Create customer transaction record
-          await tx.customerTransaction.create({
-            data: {
-              customerId: data.customerId,
-              invoiceId: invoice.id,
-              pointsEarned: pointsToAdd,
-              pointsRedeemed: 0
-            }
-          });
-        }
-
-        return invoice;
-      },
-      {
-        timeout: 15000,
-        maxWait: 15000
-      }
-    );
-    clearProductCache();
-    return invoice;
-  },
-
-  delete: async (id: string) => {
-    const prisma = getPrismaClient();
-
-    const deletedInvoice = await prisma.$transaction(async (tx) => {
-      // Get invoice details first
-      const invoice = await tx.salesInvoice.findUnique({
-        where: { id },
-        include: {
-          salesDetails: true
-        }
-      });
-
-      if (!invoice) {
-        throw new Error("Invoice not found");
-      }
-
-      // Restore product stock levels and create stock transactions
-      for (const detail of invoice.salesDetails) {
-        // Skip custom products (they don't have inventory)
-        if (!detail.productId) {
-          continue;
-        }
-
-        // Format quantity to 3 decimal places
-        const formattedQuantity = validateAndFormatQuantity(detail.quantity);
-
-        // Update Product.stockLevel
-        await tx.product.update({
-          where: { id: detail.productId },
-          data: {
-            stockLevel: {
-              increment: formattedQuantity
-            }
-          }
-        });
-
-        // Update Inventory.quantity
-        const inventory = await tx.inventory.findFirst({
-          where: { productId: detail.productId }
-        });
-
-        if (inventory) {
-          await tx.inventory.update({
-            where: { id: inventory.id },
-            data: {
-              quantity: {
-                increment: formattedQuantity
-              }
-            }
-          });
-        }
-
-        // Create stock transaction record for stock restoration
-        await tx.stockTransaction.create({
-          data: {
-            productId: detail.productId,
-            type: "IN",
-            changeQty: formattedQuantity,
-            reason: "Invoice Deletion",
-            relatedInvoiceId: invoice.id,
-            transactionDate: new Date()
-          }
-        });
-      }
-
-      await tx.salesDetail.deleteMany({
-        where: { invoiceId: id }
-      });
-
-      // Note: We keep stock transactions as audit trail
-      // await tx.stockTransaction.deleteMany({
-      //   where: { relatedInvoiceId: id }
-      // });
-
-      await tx.customerTransaction.deleteMany({
-        where: { invoiceId: id }
-      });
-
-      // Delete all payments associated with this invoice
-      await tx.payment.deleteMany({
-        where: { invoiceId: id }
-      });
-
-      // Delete the invoice
-      return await tx.salesInvoice.delete({
-        where: { id }
-      });
-    });
-    clearProductCache();
-    return deletedInvoice;
-  },
-
-  getStats: async (filters?: { dateFrom?: string; dateTo?: string }) => {
-    const prisma = getPrismaClient();
-
-    const whereClause: Record<string, unknown> = {};
-
-    if (filters?.dateFrom || filters?.dateTo) {
-      whereClause.date = {};
-      if (filters.dateFrom) {
-        (whereClause.date as Record<string, Date>).gte = new Date(filters.dateFrom);
-      }
-      if (filters.dateTo) {
-        (whereClause.date as Record<string, Date>).lte = new Date(filters.dateTo);
       }
     }
 
-    const invoices = await prisma.salesInvoice.findMany({
-      where: whereClause
-    });
+    if (data.customerId) {
+      const customerExists = db
+        .prepare("SELECT customer_id FROM customers WHERE customer_id = ? AND deleted_at IS NULL")
+        .get(data.customerId);
+      if (!customerExists) {
+        data.customerId = undefined;
+      }
+    }
 
-    const totalRevenue = invoices.reduce((sum, invoice) => sum + invoice.totalAmount, 0);
-    const totalDiscount = invoices.reduce((sum, invoice) => sum + invoice.discountAmount, 0);
-    const totalTax = invoices.reduce((sum, invoice) => sum + invoice.taxAmount, 0);
-    const totalInvoices = invoices.length;
+    const lastInvoice = db
+      .prepare("SELECT invoice_id FROM sales_invoices WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 1")
+      .get();
+
+    let nextInvoiceNumber = 1000;
+    if (lastInvoice) {
+      const match = String(lastInvoice.invoice_id ?? "").match(/^INV-(\d+)$/);
+      if (match) {
+        nextInvoiceNumber = Number(match[1]) + 1;
+      }
+    }
+
+    const invoiceNumber = `INV-${nextInvoiceNumber}`;
+    const timestamp = nowIso();
+    const invoiceRow = {
+      invoice_id: invoiceNumber,
+      date: timestamp,
+      customer_id: data.customerId ?? null,
+      employee_id: validEmployeeId,
+      sub_total: data.subTotal,
+      total_amount: data.totalAmount,
+      payment_mode: data.paymentMode,
+      tax_amount: data.taxAmount ?? 0,
+      discount_amount: data.discountAmount ?? 0,
+      amount_received: data.amountReceived,
+      outstanding_balance: data.outstandingBalance ?? 0,
+      payment_status: data.paymentStatus ?? "paid",
+      refund_invoice_id: null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO sales_invoices (
+          invoice_id,
+          date,
+          customer_id,
+          employee_id,
+          sub_total,
+          total_amount,
+          payment_mode,
+          tax_amount,
+          discount_amount,
+          amount_received,
+          outstanding_balance,
+          payment_status,
+          refund_invoice_id,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      invoiceRow.invoice_id,
+      invoiceRow.date,
+      invoiceRow.customer_id,
+      invoiceRow.employee_id,
+      invoiceRow.sub_total,
+      invoiceRow.total_amount,
+      invoiceRow.payment_mode,
+      invoiceRow.tax_amount,
+      invoiceRow.discount_amount,
+      invoiceRow.amount_received,
+      invoiceRow.outstanding_balance,
+      invoiceRow.payment_status,
+      invoiceRow.refund_invoice_id,
+      invoiceRow.version,
+      invoiceRow.created_at,
+      invoiceRow.updated_at,
+      invoiceRow.deleted_at,
+      invoiceRow.last_modified_by_device_id
+    );
+
+    enqueueOutbox("sales_invoices", invoiceRow.invoice_id, "insert", invoiceRow.version, invoiceRow);
+
+    const productIds = Array.from(
+      new Set(
+        data.salesDetails
+          .filter((detail) => detail.productId)
+          .map((detail) => detail.productId as string)
+      )
+    );
+
+    const productRows = productIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM products WHERE product_id IN (${productIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...productIds)
+      : [];
+    const productMap = new Map(productRows.map((row) => [row.product_id, row]));
+
+    for (const detail of data.salesDetails) {
+      const detailId = randomUUID();
+      const detailQuantity = validateAndFormatQuantity(detail.quantity);
+      const productRow = detail.productId ? productMap.get(detail.productId) : null;
+      const costPrice = productRow?.cost_price ?? 0;
+
+      const detailRow = {
+        sales_detail_id: detailId,
+        invoice_id: invoiceRow.invoice_id,
+        product_id: detail.productId ?? null,
+        custom_product_id: detail.customProductId ?? null,
+        unit: detail.unit ?? "pcs",
+        original_price: detail.originalPrice,
+        cost_price: costPrice,
+        quantity: detailQuantity,
+        unit_price: detail.unitPrice,
+        tax_rate: detail.taxRate ?? 0,
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp,
+        deleted_at: null,
+        last_modified_by_device_id: deviceId
+      };
+
+      db.prepare(
+        `
+          INSERT INTO sales_details (
+            sales_detail_id,
+            invoice_id,
+            product_id,
+            custom_product_id,
+            unit,
+            original_price,
+            cost_price,
+            quantity,
+            unit_price,
+            tax_rate,
+            version,
+            created_at,
+            updated_at,
+            deleted_at,
+            last_modified_by_device_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      ).run(
+        detailRow.sales_detail_id,
+        detailRow.invoice_id,
+        detailRow.product_id,
+        detailRow.custom_product_id,
+        detailRow.unit,
+        detailRow.original_price,
+        detailRow.cost_price,
+        detailRow.quantity,
+        detailRow.unit_price,
+        detailRow.tax_rate,
+        detailRow.version,
+        detailRow.created_at,
+        detailRow.updated_at,
+        detailRow.deleted_at,
+        detailRow.last_modified_by_device_id
+      );
+
+      enqueueOutbox("sales_details", detailRow.sales_detail_id, "insert", detailRow.version, detailRow);
+
+      if (!detail.productId) {
+        continue;
+      }
+
+      const inventory = db
+        .prepare("SELECT * FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+        .get(detail.productId);
+
+      if (inventory) {
+        const newQuantity = Number(inventory.quantity) - detailQuantity;
+        const invUpdatedAt = nowIso();
+        const invVersion = Number(inventory.version ?? 1) + 1;
+        const invRow = {
+          ...inventory,
+          quantity: newQuantity,
+          version: invVersion,
+          updated_at: invUpdatedAt,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            UPDATE inventory
+            SET quantity = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+            WHERE inventory_id = ?
+          `
+        ).run(
+          invRow.quantity,
+          invRow.version,
+          invRow.updated_at,
+          invRow.last_modified_by_device_id,
+          invRow.inventory_id
+        );
+        enqueueOutbox("inventory", invRow.inventory_id, "update", invRow.version, invRow);
+        updateLocalProductStockLevel(detail.productId, invRow.quantity);
+      } else {
+        const invRow = {
+          inventory_id: randomUUID(),
+          product_id: detail.productId,
+          quantity: Math.max(0, -detailQuantity),
+          reorder_level: 5,
+          batch_number: null,
+          expiry_date: null,
+          version: 1,
+          created_at: timestamp,
+          updated_at: timestamp,
+          deleted_at: null,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            INSERT INTO inventory (
+              inventory_id,
+              product_id,
+              quantity,
+              reorder_level,
+              batch_number,
+              expiry_date,
+              version,
+              created_at,
+              updated_at,
+              deleted_at,
+              last_modified_by_device_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        ).run(
+          invRow.inventory_id,
+          invRow.product_id,
+          invRow.quantity,
+          invRow.reorder_level,
+          invRow.batch_number,
+          invRow.expiry_date,
+          invRow.version,
+          invRow.created_at,
+          invRow.updated_at,
+          invRow.deleted_at,
+          invRow.last_modified_by_device_id
+        );
+        enqueueOutbox("inventory", invRow.inventory_id, "insert", invRow.version, invRow);
+        updateLocalProductStockLevel(detail.productId, invRow.quantity);
+      }
+
+      const txRow = {
+        transaction_id: randomUUID(),
+        product_id: detail.productId,
+        type: "OUT",
+        change_qty: -detailQuantity,
+        reason: "Sale",
+        transaction_date: timestamp,
+        related_invoice_id: invoiceRow.invoice_id,
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp,
+        deleted_at: null,
+        last_modified_by_device_id: deviceId
+      };
+
+      db.prepare(
+        `
+          INSERT INTO stock_transactions (
+            transaction_id,
+            product_id,
+            type,
+            change_qty,
+            reason,
+            transaction_date,
+            related_invoice_id,
+            version,
+            created_at,
+            updated_at,
+            deleted_at,
+            last_modified_by_device_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      ).run(
+        txRow.transaction_id,
+        txRow.product_id,
+        txRow.type,
+        txRow.change_qty,
+        txRow.reason,
+        txRow.transaction_date,
+        txRow.related_invoice_id,
+        txRow.version,
+        txRow.created_at,
+        txRow.updated_at,
+        txRow.deleted_at,
+        txRow.last_modified_by_device_id
+      );
+
+      enqueueOutbox("stock_transactions", txRow.transaction_id, "insert", txRow.version, txRow);
+    }
+
+    if (data.customerId) {
+      const customer = db
+        .prepare("SELECT * FROM customers WHERE customer_id = ? AND deleted_at IS NULL")
+        .get(data.customerId);
+      if (customer) {
+        const pointsToAdd = Math.floor(data.totalAmount / 10);
+        const updatedAt = nowIso();
+        const version = Number(customer.version ?? 1) + 1;
+        const customerRow = {
+          ...customer,
+          loyalty_points: Number(customer.loyalty_points) + pointsToAdd,
+          version,
+          updated_at: updatedAt,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            UPDATE customers
+            SET loyalty_points = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+            WHERE customer_id = ?
+          `
+        ).run(
+          customerRow.loyalty_points,
+          customerRow.version,
+          customerRow.updated_at,
+          customerRow.last_modified_by_device_id,
+          customerRow.customer_id
+        );
+        enqueueOutbox("customers", customerRow.customer_id, "update", customerRow.version, customerRow);
+
+        const ctRow = {
+          customer_id: data.customerId,
+          invoice_id: invoiceRow.invoice_id,
+          points_earned: pointsToAdd,
+          points_redeemed: 0,
+          version: 1,
+          created_at: timestamp,
+          updated_at: timestamp,
+          deleted_at: null,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            INSERT INTO customer_transactions (
+              customer_id,
+              invoice_id,
+              points_earned,
+              points_redeemed,
+              version,
+              created_at,
+              updated_at,
+              deleted_at,
+              last_modified_by_device_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        ).run(
+          ctRow.customer_id,
+          ctRow.invoice_id,
+          ctRow.points_earned,
+          ctRow.points_redeemed,
+          ctRow.version,
+          ctRow.created_at,
+          ctRow.updated_at,
+          ctRow.deleted_at,
+          ctRow.last_modified_by_device_id
+        );
+        enqueueOutbox(
+          "customer_transactions",
+          buildCompositeRowId({ customer_id: ctRow.customer_id, invoice_id: ctRow.invoice_id }),
+          "insert",
+          ctRow.version,
+          ctRow
+        );
+      }
+    }
+
+    return await salesInvoiceService.findById(invoiceRow.invoice_id);
+  },
+
+  delete: async (id: string) => {
+    const db = getLocalDb();
+    const invoice = db
+      .prepare("SELECT * FROM sales_invoices WHERE invoice_id = ? AND deleted_at IS NULL")
+      .get(id);
+
+    if (!invoice) {
+      throw new Error("Invoice not found");
+    }
+
+    const deviceId = ensureDeviceId();
+    const details = db
+      .prepare("SELECT * FROM sales_details WHERE invoice_id = ? AND deleted_at IS NULL")
+      .all(id);
+
+    for (const detail of details) {
+      if (detail.product_id) {
+        const inventory = db
+          .prepare("SELECT * FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+          .get(detail.product_id);
+        if (inventory) {
+          const newQuantity = Number(inventory.quantity) + Number(detail.quantity);
+          const updatedAt = nowIso();
+          const version = Number(inventory.version ?? 1) + 1;
+          const invRow = {
+            ...inventory,
+            quantity: newQuantity,
+            version,
+            updated_at: updatedAt,
+            last_modified_by_device_id: deviceId
+          };
+          db.prepare(
+            `
+              UPDATE inventory
+              SET quantity = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+              WHERE inventory_id = ?
+            `
+          ).run(
+            invRow.quantity,
+            invRow.version,
+            invRow.updated_at,
+            invRow.last_modified_by_device_id,
+            invRow.inventory_id
+          );
+          enqueueOutbox("inventory", invRow.inventory_id, "update", invRow.version, invRow);
+          updateLocalProductStockLevel(detail.product_id, invRow.quantity);
+        }
+
+        const txRow = {
+          transaction_id: randomUUID(),
+          product_id: detail.product_id,
+          type: "IN",
+          change_qty: Number(detail.quantity),
+          reason: "Invoice Deletion",
+          transaction_date: nowIso(),
+          related_invoice_id: invoice.invoice_id,
+          version: 1,
+          created_at: nowIso(),
+          updated_at: nowIso(),
+          deleted_at: null,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            INSERT INTO stock_transactions (
+              transaction_id,
+              product_id,
+              type,
+              change_qty,
+              reason,
+              transaction_date,
+              related_invoice_id,
+              version,
+              created_at,
+              updated_at,
+              deleted_at,
+              last_modified_by_device_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        ).run(
+          txRow.transaction_id,
+          txRow.product_id,
+          txRow.type,
+          txRow.change_qty,
+          txRow.reason,
+          txRow.transaction_date,
+          txRow.related_invoice_id,
+          txRow.version,
+          txRow.created_at,
+          txRow.updated_at,
+          txRow.deleted_at,
+          txRow.last_modified_by_device_id
+        );
+        enqueueOutbox("stock_transactions", txRow.transaction_id, "insert", txRow.version, txRow);
+      }
+
+      const detailDeletedAt = nowIso();
+      const detailVersion = Number(detail.version ?? 1) + 1;
+      const detailRow = {
+        ...detail,
+        deleted_at: detailDeletedAt,
+        version: detailVersion,
+        updated_at: detailDeletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE sales_details
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE sales_detail_id = ?
+        `
+      ).run(
+        detailRow.deleted_at,
+        detailRow.version,
+        detailRow.updated_at,
+        detailRow.last_modified_by_device_id,
+        detailRow.sales_detail_id
+      );
+      enqueueOutbox("sales_details", detailRow.sales_detail_id, "delete", detailRow.version, detailRow);
+    }
+
+    const customerTransactions = db
+      .prepare("SELECT * FROM customer_transactions WHERE invoice_id = ? AND deleted_at IS NULL")
+      .all(id);
+    for (const ct of customerTransactions) {
+      const ctDeletedAt = nowIso();
+      const ctVersion = Number(ct.version ?? 1) + 1;
+      const ctRow = {
+        ...ct,
+        deleted_at: ctDeletedAt,
+        version: ctVersion,
+        updated_at: ctDeletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE customer_transactions
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE customer_id = ? AND invoice_id = ?
+        `
+      ).run(
+        ctRow.deleted_at,
+        ctRow.version,
+        ctRow.updated_at,
+        ctRow.last_modified_by_device_id,
+        ctRow.customer_id,
+        ctRow.invoice_id
+      );
+      enqueueOutbox(
+        "customer_transactions",
+        buildCompositeRowId({ customer_id: ctRow.customer_id, invoice_id: ctRow.invoice_id }),
+        "delete",
+        ctRow.version,
+        ctRow
+      );
+    }
+
+    const payments = db
+      .prepare("SELECT * FROM payments WHERE invoice_id = ? AND deleted_at IS NULL")
+      .all(id);
+    for (const payment of payments) {
+      const deletedAt = nowIso();
+      const version = Number(payment.version ?? 1) + 1;
+      const row = {
+        ...payment,
+        deleted_at: deletedAt,
+        version,
+        updated_at: deletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE payments
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE payment_id = ?
+        `
+      ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, row.payment_id);
+      enqueueOutbox("payments", row.payment_id, "delete", row.version, row);
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(invoice.version ?? 1) + 1;
+    const invoiceRow = {
+      ...invoice,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE sales_invoices
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE invoice_id = ?
+      `
+    ).run(
+      invoiceRow.deleted_at,
+      invoiceRow.version,
+      invoiceRow.updated_at,
+      invoiceRow.last_modified_by_device_id,
+      invoiceRow.invoice_id
+    );
+
+    enqueueOutbox("sales_invoices", invoiceRow.invoice_id, "delete", invoiceRow.version, invoiceRow);
+    clearProductCache();
+    return invoiceRow;
+  },
+
+  getStats: async (filters?: { dateFrom?: string; dateTo?: string }) => {
+    const rows = await salesInvoiceService.getFiltered(filters);
+    const totalRevenue = rows.reduce((sum: number, invoice: any) => sum + Number(invoice.total_amount), 0);
+    const totalDiscount = rows.reduce((sum: number, invoice: any) => sum + Number(invoice.discount_amount), 0);
+    const totalTax = rows.reduce((sum: number, invoice: any) => sum + Number(invoice.tax_amount), 0);
+    const totalInvoices = rows.length;
     const averageOrderValue = totalInvoices > 0 ? totalRevenue / totalInvoices : 0;
 
     return {
@@ -1631,183 +2761,436 @@ export const salesInvoiceService = {
     };
   },
 
-  // Perform a full refund for an existing invoice
   refund: async (originalInvoiceId: string, options?: { employeeId?: string; reason?: string }) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const deviceId = ensureDeviceId();
 
-    const refundResult = await prisma.$transaction(async (tx) => {
-      // Fetch original invoice with details
-      const original = await tx.salesInvoice.findUnique({
-        where: { id: originalInvoiceId },
-        include: { salesDetails: true, customer: true }
-      });
-      console.log("Original invoice:", original);
-      if (!original) throw new Error("Original invoice not found");
+    const original = db
+      .prepare("SELECT * FROM sales_invoices WHERE invoice_id = ? AND deleted_at IS NULL")
+      .get(originalInvoiceId);
+    if (!original) {
+      throw new Error("Original invoice not found");
+    }
 
-      // Prevent double refunds by checking if already refunded
-      if (original.refundInvoiceId) {
-        throw new Error("This invoice has already been refunded");
+    if (original.refund_invoice_id) {
+      throw new Error("This invoice has already been refunded");
+    }
+
+    const details = db
+      .prepare("SELECT * FROM sales_details WHERE invoice_id = ? AND deleted_at IS NULL")
+      .all(originalInvoiceId);
+
+    const lastInvoice = db
+      .prepare(
+        "SELECT invoice_id FROM sales_invoices WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 1"
+      )
+      .get();
+
+    let nextInvoiceNumber = 1000;
+    if (lastInvoice) {
+      const match = String(lastInvoice.invoice_id ?? "").match(/^INV-(\d+)$/);
+      if (match) {
+        nextInvoiceNumber = Number(match[1]) + 1;
       }
+    }
 
-      // Build refund invoice data - we create a new invoice that references the original
-      const refundSalesDetails = original.salesDetails.map((d) => ({
-        productId: d.productId,
-        quantity: d.quantity,
-        unitPrice: d.unitPrice,
-        taxRate: d.taxRate || 0
-      }));
+    const refundInvoiceId = `INV-${nextInvoiceNumber}`;
+    const timestamp = nowIso();
+    const refundRow = {
+      invoice_id: refundInvoiceId,
+      date: timestamp,
+      customer_id: original.customer_id,
+      employee_id: options?.employeeId ?? original.employee_id,
+      sub_total: -Number(original.sub_total),
+      total_amount: -Number(original.total_amount),
+      payment_mode: original.payment_mode,
+      tax_amount: -Number(original.tax_amount),
+      discount_amount: -Number(original.discount_amount),
+      amount_received: -Number(original.amount_received),
+      outstanding_balance: 0,
+      payment_status: "paid",
+      refund_invoice_id: null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
 
-      // Generate new invoice number for refund
-      const lastInvoice = await tx.salesInvoice.findFirst({
-        orderBy: { createdAt: "desc" },
-        select: { id: true }
-      });
+    db.prepare(
+      `
+        INSERT INTO sales_invoices (
+          invoice_id,
+          date,
+          customer_id,
+          employee_id,
+          sub_total,
+          total_amount,
+          payment_mode,
+          tax_amount,
+          discount_amount,
+          amount_received,
+          outstanding_balance,
+          payment_status,
+          refund_invoice_id,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      refundRow.invoice_id,
+      refundRow.date,
+      refundRow.customer_id,
+      refundRow.employee_id,
+      refundRow.sub_total,
+      refundRow.total_amount,
+      refundRow.payment_mode,
+      refundRow.tax_amount,
+      refundRow.discount_amount,
+      refundRow.amount_received,
+      refundRow.outstanding_balance,
+      refundRow.payment_status,
+      refundRow.refund_invoice_id,
+      refundRow.version,
+      refundRow.created_at,
+      refundRow.updated_at,
+      refundRow.deleted_at,
+      refundRow.last_modified_by_device_id
+    );
 
-      let nextInvoiceNumber = 1000; // Starting number
-      if (lastInvoice) {
-        const lastIdMatch = lastInvoice.id.match(/^INV-(\d+)$/);
-        if (lastIdMatch) {
-          nextInvoiceNumber = parseInt(lastIdMatch[1]) + 1;
-        }
-      }
-      const invoiceNumber = `INV-${nextInvoiceNumber}`;
+    enqueueOutbox("sales_invoices", refundRow.invoice_id, "insert", refundRow.version, refundRow);
 
-      const refundInvoice = await tx.salesInvoice.create({
-        data: {
-          id: invoiceNumber,
-          customerId: original.customerId,
-          employeeId: options?.employeeId || original.employeeId,
-          subTotal: -original.subTotal,
-          totalAmount: -original.totalAmount,
-          paymentMode: original.paymentMode,
-          taxAmount: -original.taxAmount,
-          discountAmount: -original.discountAmount,
-          amountReceived: -original.amountReceived,
-          salesDetails: {
-            create: refundSalesDetails
-          }
-        },
-        include: { salesDetails: true }
-      });
+    for (const detail of details) {
+      const detailRow = {
+        sales_detail_id: randomUUID(),
+        invoice_id: refundRow.invoice_id,
+        product_id: detail.product_id,
+        custom_product_id: detail.custom_product_id,
+        unit: detail.unit,
+        original_price: detail.original_price,
+        cost_price: detail.cost_price,
+        quantity: detail.quantity,
+        unit_price: detail.unit_price,
+        tax_rate: detail.tax_rate,
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp,
+        deleted_at: null,
+        last_modified_by_device_id: deviceId
+      };
 
-      // Restore product stock levels and inventory (IN transactions)
-      for (const detail of original.salesDetails) {
-        // Skip custom products (they don't have inventory)
-        if (!detail.productId) {
-          continue;
-        }
+      db.prepare(
+        `
+          INSERT INTO sales_details (
+            sales_detail_id,
+            invoice_id,
+            product_id,
+            custom_product_id,
+            unit,
+            original_price,
+            cost_price,
+            quantity,
+            unit_price,
+            tax_rate,
+            version,
+            created_at,
+            updated_at,
+            deleted_at,
+            last_modified_by_device_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      ).run(
+        detailRow.sales_detail_id,
+        detailRow.invoice_id,
+        detailRow.product_id,
+        detailRow.custom_product_id,
+        detailRow.unit,
+        detailRow.original_price,
+        detailRow.cost_price,
+        detailRow.quantity,
+        detailRow.unit_price,
+        detailRow.tax_rate,
+        detailRow.version,
+        detailRow.created_at,
+        detailRow.updated_at,
+        detailRow.deleted_at,
+        detailRow.last_modified_by_device_id
+      );
 
-        await tx.product.update({
-          where: { id: detail.productId },
-          data: {
-            stockLevel: { increment: detail.quantity }
-          }
-        });
+      enqueueOutbox("sales_details", detailRow.sales_detail_id, "insert", detailRow.version, detailRow);
 
-        const inventory = await tx.inventory.findFirst({ where: { productId: detail.productId } });
+      if (detail.product_id) {
+        const inventory = db
+          .prepare("SELECT * FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+          .get(detail.product_id);
         if (inventory) {
-          await tx.inventory.update({
-            where: { id: inventory.id },
-            data: {
-              quantity: { increment: detail.quantity }
-            }
-          });
-        } else {
-          await tx.inventory.create({
-            data: {
-              productId: detail.productId,
-              quantity: detail.quantity,
-              reorderLevel: 5
-            }
-          });
+          const newQuantity = Number(inventory.quantity) + Number(detail.quantity);
+          const updatedAt = nowIso();
+          const version = Number(inventory.version ?? 1) + 1;
+          const invRow = {
+            ...inventory,
+            quantity: newQuantity,
+            version,
+            updated_at: updatedAt,
+            last_modified_by_device_id: deviceId
+          };
+          db.prepare(
+            `
+              UPDATE inventory
+              SET quantity = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+              WHERE inventory_id = ?
+            `
+          ).run(
+            invRow.quantity,
+            invRow.version,
+            invRow.updated_at,
+            invRow.last_modified_by_device_id,
+            invRow.inventory_id
+          );
+          enqueueOutbox("inventory", invRow.inventory_id, "update", invRow.version, invRow);
+          updateLocalProductStockLevel(detail.product_id, invRow.quantity);
         }
 
-        await tx.stockTransaction.create({
-          data: {
-            productId: detail.productId,
-            type: "IN",
-            changeQty: detail.quantity,
-            reason: options?.reason || "Refund",
-            relatedInvoiceId: original.id
-          }
-        });
+        const txRow = {
+          transaction_id: randomUUID(),
+          product_id: detail.product_id,
+          type: "IN",
+          change_qty: Number(detail.quantity),
+          reason: options?.reason ?? "Refund",
+          transaction_date: nowIso(),
+          related_invoice_id: original.invoice_id,
+          version: 1,
+          created_at: nowIso(),
+          updated_at: nowIso(),
+          deleted_at: null,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            INSERT INTO stock_transactions (
+              transaction_id,
+              product_id,
+              type,
+              change_qty,
+              reason,
+              transaction_date,
+              related_invoice_id,
+              version,
+              created_at,
+              updated_at,
+              deleted_at,
+              last_modified_by_device_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        ).run(
+          txRow.transaction_id,
+          txRow.product_id,
+          txRow.type,
+          txRow.change_qty,
+          txRow.reason,
+          txRow.transaction_date,
+          txRow.related_invoice_id,
+          txRow.version,
+          txRow.created_at,
+          txRow.updated_at,
+          txRow.deleted_at,
+          txRow.last_modified_by_device_id
+        );
+        enqueueOutbox("stock_transactions", txRow.transaction_id, "insert", txRow.version, txRow);
       }
+    }
 
-      // Reverse loyalty points if applicable
-      if (original.customerId) {
-        const pointsToRemove = Math.floor(original.totalAmount / 10);
-        await tx.customer.update({
-          where: { id: original.customerId },
-          data: {
-            loyaltyPoints: { decrement: pointsToRemove }
-          }
-        });
+    if (original.customer_id) {
+      const customer = db
+        .prepare("SELECT * FROM customers WHERE customer_id = ? AND deleted_at IS NULL")
+        .get(original.customer_id);
+      if (customer) {
+        const pointsToRemove = Math.floor(Number(original.total_amount) / 10);
+        const updatedAt = nowIso();
+        const version = Number(customer.version ?? 1) + 1;
+        const customerRow = {
+          ...customer,
+          loyalty_points: Number(customer.loyalty_points) - pointsToRemove,
+          version,
+          updated_at: updatedAt,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            UPDATE customers
+            SET loyalty_points = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+            WHERE customer_id = ?
+          `
+        ).run(
+          customerRow.loyalty_points,
+          customerRow.version,
+          customerRow.updated_at,
+          customerRow.last_modified_by_device_id,
+          customerRow.customer_id
+        );
+        enqueueOutbox("customers", customerRow.customer_id, "update", customerRow.version, customerRow);
 
-        // Update existing customer transaction record (add to points redeemed)
-        await tx.customerTransaction.update({
-          where: {
-            customerId_invoiceId: {
-              customerId: original.customerId,
-              invoiceId: original.id
-            }
-          },
-          data: {
-            pointsRedeemed: { increment: pointsToRemove }
-          }
-        });
+        const existingTx = db
+          .prepare(
+            "SELECT * FROM customer_transactions WHERE customer_id = ? AND invoice_id = ? AND deleted_at IS NULL"
+          )
+          .get(original.customer_id, original.invoice_id);
+        if (existingTx) {
+          const ctUpdatedAt = nowIso();
+          const ctVersion = Number(existingTx.version ?? 1) + 1;
+          const ctRow = {
+            ...existingTx,
+            points_redeemed: Number(existingTx.points_redeemed) + pointsToRemove,
+            version: ctVersion,
+            updated_at: ctUpdatedAt,
+            last_modified_by_device_id: deviceId
+          };
+          db.prepare(
+            `
+              UPDATE customer_transactions
+              SET points_redeemed = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+              WHERE customer_id = ? AND invoice_id = ?
+            `
+          ).run(
+            ctRow.points_redeemed,
+            ctRow.version,
+            ctRow.updated_at,
+            ctRow.last_modified_by_device_id,
+            ctRow.customer_id,
+            ctRow.invoice_id
+          );
+          enqueueOutbox(
+            "customer_transactions",
+            buildCompositeRowId({ customer_id: ctRow.customer_id, invoice_id: ctRow.invoice_id }),
+            "update",
+            ctRow.version,
+            ctRow
+          );
+        }
       }
+    }
 
-      // Link original invoice to refund invoice
-      await tx.salesInvoice.update({
-        where: { id: original.id },
-        data: { refundInvoiceId: refundInvoice.id }
-      });
+    const originalUpdatedAt = nowIso();
+    const originalVersion = Number(original.version ?? 1) + 1;
+    const originalRow = {
+      ...original,
+      refund_invoice_id: refundRow.invoice_id,
+      version: originalVersion,
+      updated_at: originalUpdatedAt,
+      last_modified_by_device_id: deviceId
+    };
 
-      return { originalInvoiceId: original.id, refundInvoice };
-    });
+    db.prepare(
+      `
+        UPDATE sales_invoices
+        SET refund_invoice_id = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE invoice_id = ?
+      `
+    ).run(
+      originalRow.refund_invoice_id,
+      originalRow.version,
+      originalRow.updated_at,
+      originalRow.last_modified_by_device_id,
+      originalRow.invoice_id
+    );
+
+    enqueueOutbox("sales_invoices", originalRow.invoice_id, "update", originalRow.version, originalRow);
     clearProductCache();
-    return refundResult;
+    return { originalInvoiceId: originalRow.invoice_id, refundInvoice: refundRow };
   }
 };
 
 export const customerService = {
   findMany: async (options?: FindManyOptions) => {
-    const prisma = getPrismaClient();
-    const query: Record<string, unknown> = {
-      orderBy: { createdAt: "desc" }
-    };
+    const db = getLocalDb();
+    const selectKeys =
+      options?.select && Object.keys(options.select).filter((key) => options.select?.[key]);
+    const columns = selectKeys && selectKeys.length > 0 ? selectKeys.join(", ") : "*";
 
-    if (options?.select) {
-      query.select = options.select;
+    let sql = `SELECT ${columns} FROM customers WHERE deleted_at IS NULL ORDER BY created_at DESC`;
+    const params: Array<string | number> = [];
+    if (options?.pagination?.take) {
+      sql += " LIMIT ?";
+      params.push(options.pagination.take);
+    }
+    if (options?.pagination?.skip) {
+      sql += " OFFSET ?";
+      params.push(options.pagination.skip);
     }
 
-    applyPagination(query, options?.pagination);
-    return await prisma.customer.findMany(query as any);
+    return db.prepare(sql).all(...params);
   },
 
   create: async (data: { name: string; email?: string; phone?: string; preferences?: string }) => {
-    const prisma = getPrismaClient();
-
-    // Check for duplicate email if provided
+    const db = getLocalDb();
     if (data.email) {
-      const existingCustomer = await prisma.customer.findFirst({
-        where: { email: data.email }
-      });
-
-      if (existingCustomer) {
+      const existing = db
+        .prepare("SELECT customer_id FROM customers WHERE email = ? AND deleted_at IS NULL")
+        .get(data.email);
+      if (existing) {
         throw new Error(`Customer with email "${data.email}" already exists`);
       }
     }
 
-    return await prisma.customer.create({
-      data: {
-        name: data.name,
-        email: data.email,
-        phone: data.phone,
-        preferences: data.preferences,
-        loyaltyPoints: 0
-      }
-    });
+    const customerId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      customer_id: customerId,
+      name: data.name,
+      email: data.email ?? null,
+      phone: data.phone ?? null,
+      address: null,
+      loyalty_points: 0,
+      preferences: data.preferences ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO customers (
+          customer_id,
+          name,
+          email,
+          phone,
+          address,
+          loyalty_points,
+          preferences,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.customer_id,
+      row.name,
+      row.email,
+      row.phone,
+      row.address,
+      row.loyalty_points,
+      row.preferences,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox("customers", row.customer_id, "insert", row.version, row);
+    return row;
   },
 
   update: async (
@@ -1820,80 +3203,190 @@ export const customerService = {
       loyaltyPoints?: number;
     }
   ) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM customers WHERE customer_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Customer not found");
+    }
 
-    // Check for duplicate email if provided
     if (data.email) {
-      const existingCustomer = await prisma.customer.findFirst({
-        where: {
-          email: data.email,
-          NOT: { id }
-        }
-      });
-
-      if (existingCustomer) {
+      const duplicate = db
+        .prepare(
+          "SELECT customer_id FROM customers WHERE email = ? AND customer_id != ? AND deleted_at IS NULL"
+        )
+        .get(data.email, id);
+      if (duplicate) {
         throw new Error(`Customer with email "${data.email}" already exists`);
       }
     }
 
-    return await prisma.customer.update({
-      where: { id },
-      data
-    });
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      name: data.name ?? existing.name,
+      email: data.email ?? existing.email,
+      phone: data.phone ?? existing.phone,
+      preferences: data.preferences ?? existing.preferences,
+      loyalty_points: data.loyaltyPoints ?? existing.loyalty_points,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE customers
+        SET name = ?, email = ?, phone = ?, preferences = ?, loyalty_points = ?,
+            version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE customer_id = ?
+      `
+    ).run(
+      row.name,
+      row.email,
+      row.phone,
+      row.preferences,
+      row.loyalty_points,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("customers", id, "update", row.version, row);
+    return row;
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.customer.delete({
-      where: { id }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM customers WHERE customer_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Customer not found");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    db.prepare(
+      `
+        UPDATE customers
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE customer_id = ?
+      `
+    ).run(deletedAt, version, deletedAt, deviceId, id);
+
+    const payload = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+    enqueueOutbox("customers", id, "delete", version, payload);
+    return payload;
   },
 
   findByEmail: async (email: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.customer.findFirst({
-      where: { email }
-    });
+    const db = getLocalDb();
+    return db
+      .prepare("SELECT * FROM customers WHERE email = ? AND deleted_at IS NULL")
+      .get(email);
   },
 
   findByPhone: async (phone: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.customer.findFirst({
-      where: { phone }
-    });
+    const db = getLocalDb();
+    return db
+      .prepare("SELECT * FROM customers WHERE phone = ? AND deleted_at IS NULL")
+      .get(phone);
   }
 };
 
 // Inventory Service
 export const inventoryService = {
   findMany: async (filters?: InventoryFilters, options?: FindManyOptions) => {
-    const prisma = getPrismaClient();
-    const where = await buildInventoryWhereClause(prisma, filters);
+    const db = getLocalDb();
+    const selectKeys =
+      options?.select && Object.keys(options.select).filter((key) => options.select?.[key]);
+    const columns = selectKeys && selectKeys.length > 0 ? selectKeys.join(", ") : "*";
 
-    const query: Record<string, unknown> = {
-      where,
-      orderBy: { updatedAt: "desc" }
-    };
+    let rows = db
+      .prepare(`SELECT ${columns} FROM inventory WHERE deleted_at IS NULL`)
+      .all() as any[];
 
-    if (options?.select) {
-      query.select = options.select;
-    } else {
-      query.include = {
-        product: {
-          include: {
-            category: true
-          }
-        }
-      };
+    if (filters?.productId) {
+      rows = rows.filter((row) => row.product_id === filters.productId);
     }
 
-    applyPagination(query, options?.pagination);
-    return await prisma.inventory.findMany(query as any);
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
+    const productMap = new Map(products.map((product: any) => [product.product_id, product]));
+    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
+    const categoryMap = new Map(categories.map((cat: any) => [cat.category_id, cat]));
+
+    if (filters?.searchTerm) {
+      const term = filters.searchTerm.trim().toLowerCase();
+      if (term) {
+        rows = rows.filter((row) => {
+          const product = productMap.get(row.product_id);
+          return (
+            String(row.batch_number ?? "").toLowerCase().includes(term) ||
+            String(product?.name ?? "").toLowerCase().includes(term) ||
+            String(product?.english_name ?? "").toLowerCase().includes(term) ||
+            String(product?.sku ?? "").toLowerCase().includes(term) ||
+            String(product?.barcode ?? "").toLowerCase().includes(term)
+          );
+        });
+      }
+    }
+
+    if (filters?.expiringSoon) {
+      const threshold = new Date();
+      threshold.setDate(threshold.getDate() + 7);
+      rows = rows.filter((row) => {
+        if (!row.expiry_date) {
+          return false;
+        }
+        return new Date(row.expiry_date) <= threshold;
+      });
+    }
+
+    if (filters?.lowStock) {
+      rows = rows.filter((row) => Number(row.quantity) <= Number(row.reorder_level));
+    }
+
+    rows.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+
+    if (options?.pagination?.skip) {
+      rows = rows.slice(options.pagination.skip);
+    }
+    if (options?.pagination?.take) {
+      rows = rows.slice(0, options.pagination.take);
+    }
+
+    if (options?.select) {
+      return rows;
+    }
+
+    return rows.map((row) => {
+      const product = productMap.get(row.product_id);
+      return {
+        ...row,
+        product: product
+          ? {
+              ...product,
+              category: product.category_id ? categoryMap.get(product.category_id) ?? null : null
+            }
+          : null
+      };
+    });
   },
   count: async (filters?: InventoryFilters) => {
-    const prisma = getPrismaClient();
-    const where = await buildInventoryWhereClause(prisma, filters);
-    return await prisma.inventory.count({ where } as any);
+    const rows = await inventoryService.findMany(filters);
+    return rows.length;
   },
 
   create: async (data: {
@@ -1903,54 +3396,89 @@ export const inventoryService = {
     batchNumber?: string;
     expiryDate?: Date;
   }) => {
-    const prisma = getPrismaClient();
-    console.log(data);
-    const productExists = await prisma.product.findUnique({
-      where: { id: data.productId }
-    });
-
-    if (!productExists) {
+    const db = getLocalDb();
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(data.productId);
+    if (!product) {
       throw new Error(`Product with ID "${data.productId}" does not exist`);
     }
 
-    const existing = await prisma.inventory.findFirst({
-      where: {
-        productId: data.productId
-      }
-    });
-
+    const existing = db
+      .prepare("SELECT inventory_id FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+      .get(data.productId);
     if (existing) {
       throw new Error(
-        `Inventory record already exists for this product. Current quantity: ${existing.quantity}. Use update or adjust stock instead.`
+        "Inventory record already exists for this product. Use update or adjust stock instead."
       );
     }
 
-    const inventory = await prisma.$transaction(async (tx) => {
-      const formattedQuantity = validateAndFormatQuantity(data.quantity);
+    const inventoryId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const formattedQuantity = validateAndFormatQuantity(data.quantity);
+    const row = {
+      inventory_id: inventoryId,
+      product_id: data.productId,
+      quantity: formattedQuantity,
+      reorder_level: data.reorderLevel,
+      batch_number: data.batchNumber ?? null,
+      expiry_date: data.expiryDate ? new Date(data.expiryDate).toISOString() : null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
 
-      const inventory = await tx.inventory.create({
-        data: {
-          ...data,
-          quantity: formattedQuantity
-        },
-        include: {
-          product: {
-            include: {
-              category: true
-            }
-          }
-        }
-      });
+    db.prepare(
+      `
+        INSERT INTO inventory (
+          inventory_id,
+          product_id,
+          quantity,
+          reorder_level,
+          batch_number,
+          expiry_date,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.inventory_id,
+      row.product_id,
+      row.quantity,
+      row.reorder_level,
+      row.batch_number,
+      row.expiry_date,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
 
-      await tx.product.update({
-        where: { id: data.productId },
-        data: { stockLevel: formattedQuantity }
-      });
-
-      return inventory;
-    });
+    enqueueOutbox("inventory", row.inventory_id, "insert", row.version, row);
+    updateLocalProductStockLevel(data.productId, formattedQuantity);
     clearProductCache();
-    return inventory;
+
+    const category = product.category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(product.category_id)
+      : null;
+
+    return {
+      ...row,
+      product: {
+        ...product,
+        category
+      }
+    };
   },
 
   // Upsert method: create if doesn't exist, update if exists
@@ -1961,58 +3489,117 @@ export const inventoryService = {
     batchNumber?: string;
     expiryDate?: Date;
   }) => {
-    const prisma = getPrismaClient();
-
-    // Validate productId exists
-    const productExists = await prisma.product.findUnique({
-      where: { id: data.productId }
-    });
-
-    if (!productExists) {
+    const db = getLocalDb();
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(data.productId);
+    if (!product) {
       throw new Error(`Product with ID "${data.productId}" does not exist`);
     }
 
-    const inventory = await prisma.$transaction(async (tx) => {
-      // Format quantity to 3 decimal places
-      const formattedQuantity = validateAndFormatQuantity(data.quantity);
+    const existing = db
+      .prepare("SELECT * FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+      .get(data.productId);
 
-      // Use Prisma's built-in upsert with the unique constraint
-      const inventory = await tx.inventory.upsert({
-        where: {
-          productId: data.productId
-        },
-        update: {
-          quantity: formattedQuantity,
-          reorderLevel: data.reorderLevel,
-          batchNumber: data.batchNumber,
-          expiryDate: data.expiryDate
-        },
-        create: {
-          productId: data.productId,
-          quantity: formattedQuantity,
-          reorderLevel: data.reorderLevel,
-          batchNumber: data.batchNumber,
-          expiryDate: data.expiryDate
-        },
-        include: {
-          product: {
-            include: {
-              category: true
-            }
-          }
-        }
-      });
+    const formattedQuantity = validateAndFormatQuantity(data.quantity);
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
 
-      // Update Product stockLevel to match inventory
-      await tx.product.update({
-        where: { id: data.productId },
-        data: { stockLevel: inventory.quantity }
-      });
+    let row: any;
+    if (existing) {
+      const version = Number(existing.version ?? 1) + 1;
+      row = {
+        ...existing,
+        quantity: formattedQuantity,
+        reorder_level: data.reorderLevel,
+        batch_number: data.batchNumber ?? null,
+        expiry_date: data.expiryDate ? new Date(data.expiryDate).toISOString() : null,
+        version,
+        updated_at: updatedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE inventory
+          SET quantity = ?, reorder_level = ?, batch_number = ?, expiry_date = ?,
+              version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE inventory_id = ?
+        `
+      ).run(
+        row.quantity,
+        row.reorder_level,
+        row.batch_number,
+        row.expiry_date,
+        row.version,
+        row.updated_at,
+        row.last_modified_by_device_id,
+        row.inventory_id
+      );
+      enqueueOutbox("inventory", row.inventory_id, "update", row.version, row);
+    } else {
+      const timestamp = nowIso();
+      row = {
+        inventory_id: randomUUID(),
+        product_id: data.productId,
+        quantity: formattedQuantity,
+        reorder_level: data.reorderLevel,
+        batch_number: data.batchNumber ?? null,
+        expiry_date: data.expiryDate ? new Date(data.expiryDate).toISOString() : null,
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp,
+        deleted_at: null,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          INSERT INTO inventory (
+            inventory_id,
+            product_id,
+            quantity,
+            reorder_level,
+            batch_number,
+            expiry_date,
+            version,
+            created_at,
+            updated_at,
+            deleted_at,
+            last_modified_by_device_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      ).run(
+        row.inventory_id,
+        row.product_id,
+        row.quantity,
+        row.reorder_level,
+        row.batch_number,
+        row.expiry_date,
+        row.version,
+        row.created_at,
+        row.updated_at,
+        row.deleted_at,
+        row.last_modified_by_device_id
+      );
+      enqueueOutbox("inventory", row.inventory_id, "insert", row.version, row);
+    }
 
-      return inventory;
-    });
+    updateLocalProductStockLevel(data.productId, formattedQuantity);
     clearProductCache();
-    return inventory;
+
+    const category = product.category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(product.category_id)
+      : null;
+
+    return {
+      ...row,
+      product: {
+        ...product,
+        category
+      }
+    };
   },
 
   update: async (
@@ -2024,124 +3611,243 @@ export const inventoryService = {
       expiryDate?: Date;
     }
   ) => {
-    const prisma = getPrismaClient();
-
-    // Format quantity to 3 decimal places if provided
-    const updateData = { ...data };
-    if (updateData.quantity !== undefined) {
-      updateData.quantity = validateAndFormatQuantity(updateData.quantity);
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM inventory WHERE inventory_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Inventory record not found");
     }
 
-    return await prisma.inventory.update({
-      where: { id },
-      data: updateData,
-      include: {
-        product: {
-          include: {
-            category: true
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const quantity =
+      data.quantity !== undefined ? validateAndFormatQuantity(data.quantity) : existing.quantity;
+    const row = {
+      ...existing,
+      quantity,
+      reorder_level: data.reorderLevel ?? existing.reorder_level,
+      batch_number: data.batchNumber ?? existing.batch_number,
+      expiry_date: data.expiryDate ? new Date(data.expiryDate).toISOString() : existing.expiry_date,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE inventory
+        SET quantity = ?, reorder_level = ?, batch_number = ?, expiry_date = ?,
+            version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE inventory_id = ?
+      `
+    ).run(
+      row.quantity,
+      row.reorder_level,
+      row.batch_number,
+      row.expiry_date,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("inventory", id, "update", row.version, row);
+    updateLocalProductStockLevel(existing.product_id, row.quantity);
+    clearProductCache();
+
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(existing.product_id);
+    const category = product?.category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(product.category_id)
+      : null;
+
+    return {
+      ...row,
+      product: product
+        ? {
+            ...product,
+            category
           }
-        }
-      }
-    });
+        : null
+    };
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.inventory.delete({
-      where: { id }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM inventory WHERE inventory_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Inventory record not found");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    db.prepare(
+      `
+        UPDATE inventory
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE inventory_id = ?
+      `
+    ).run(deletedAt, version, deletedAt, deviceId, id);
+
+    const payload = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+    enqueueOutbox("inventory", id, "delete", version, payload);
+    return payload;
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.inventory.findUnique({
-      where: { id },
-      include: {
-        product: {
-          include: {
-            category: true
+    const db = getLocalDb();
+    const row = db
+      .prepare("SELECT * FROM inventory WHERE inventory_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!row) {
+      return null;
+    }
+
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(row.product_id);
+    const category = product?.category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(product.category_id)
+      : null;
+
+    return {
+      ...row,
+      product: product
+        ? {
+            ...product,
+            category
           }
-        }
-      }
-    });
+        : null
+    };
   },
 
   // Quick adjust method for updating stock with reason tracking
   quickAdjust: async (id: string, newQuantity: number, reason: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const inventory = db
+      .prepare("SELECT * FROM inventory WHERE inventory_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!inventory) {
+      throw new Error("Inventory item not found");
+    }
 
-    const updatedInventory = await prisma.$transaction(async (tx) => {
-      // Get current inventory
-      const inventory = await tx.inventory.findUnique({
-        where: { id },
-        include: {
-          product: true
-        }
-      });
+    const formattedQuantity = validateAndFormatQuantity(newQuantity);
+    const changeQty = formattedQuantity - Number(inventory.quantity);
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(inventory.version ?? 1) + 1;
+    const row = {
+      ...inventory,
+      quantity: formattedQuantity,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
 
-      if (!inventory) {
-        throw new Error("Inventory item not found");
-      }
+    db.prepare(
+      `
+        UPDATE inventory
+        SET quantity = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE inventory_id = ?
+      `
+    ).run(row.quantity, row.version, row.updated_at, row.last_modified_by_device_id, id);
 
-      const previousQuantity = inventory.quantity;
-      const changeQty = newQuantity - previousQuantity;
+    enqueueOutbox("inventory", id, "update", row.version, row);
 
-      // Update inventory
-      const updatedInventory = await tx.inventory.update({
-        where: { id },
-        data: { quantity: newQuantity },
-        include: {
-          product: {
-            include: {
-              category: true
-            }
-          }
-        }
-      });
+    if (changeQty != 0) {
+      const transactionId = randomUUID();
+      const timestamp = nowIso();
+      const txRow = {
+        transaction_id: transactionId,
+        product_id: inventory.product_id,
+        type: changeQty >= 0 ? "IN" : "OUT",
+        change_qty: changeQty,
+        reason,
+        transaction_date: timestamp,
+        related_invoice_id: null,
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp,
+        deleted_at: null,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          INSERT INTO stock_transactions (
+            transaction_id,
+            product_id,
+            type,
+            change_qty,
+            reason,
+            transaction_date,
+            related_invoice_id,
+            version,
+            created_at,
+            updated_at,
+            deleted_at,
+            last_modified_by_device_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      ).run(
+        txRow.transaction_id,
+        txRow.product_id,
+        txRow.type,
+        txRow.change_qty,
+        txRow.reason,
+        txRow.transaction_date,
+        txRow.related_invoice_id,
+        txRow.version,
+        txRow.created_at,
+        txRow.updated_at,
+        txRow.deleted_at,
+        txRow.last_modified_by_device_id
+      );
 
-      // Create stock transaction record
-      if (changeQty !== 0) {
-        await tx.stockTransaction.create({
-          data: {
-            productId: inventory.productId,
-            changeQty: changeQty,
-            reason: reason,
-            transactionDate: new Date(),
-            relatedInvoiceId: null
-          }
-        });
+      enqueueOutbox("stock_transactions", txRow.transaction_id, "insert", txRow.version, txRow);
+      updateLocalProductStockLevel(inventory.product_id, formattedQuantity);
+    }
 
-        // Update Product stockLevel to match inventory
-        await tx.product.update({
-          where: { id: inventory.productId },
-          data: { stockLevel: newQuantity }
-        });
-      }
-
-      return updatedInventory;
-    });
     clearProductCache();
-    return updatedInventory;
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(inventory.product_id);
+    const category = product?.category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(product.category_id)
+      : null;
+
+    return {
+      ...row,
+      product: product
+        ? {
+            ...product,
+            category
+          }
+        : null
+    };
   },
 
   getLowStockItems: async () => {
-    const prisma = getPrismaClient();
-
-    // For now, return all items and filter in the application layer
-    // TODO: Use raw SQL query when database corruption is fixed
-    const allItems = await prisma.inventory.findMany({
-      include: {
-        product: {
-          include: {
-            category: true
-          }
-        }
-      },
-      orderBy: { quantity: "asc" }
-    });
-
-    // Filter items where quantity is less than or equal to reorder level
-    return allItems.filter((item) => item.quantity <= item.reorderLevel);
+    const rows = await inventoryService.findMany();
+    return rows.filter((item: any) => Number(item.quantity) <= Number(item.reorder_level));
   },
 
   adjustStock: async (
@@ -2150,128 +3856,241 @@ export const inventoryService = {
     reason: string,
     relatedInvoiceId?: string
   ) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const inventory = db
+      .prepare("SELECT * FROM inventory WHERE inventory_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!inventory) {
+      throw new Error("Inventory record not found");
+    }
 
-    const updatedInventory = await prisma.$transaction(async (tx) => {
-      // Get current inventory
-      const inventory = await tx.inventory.findUnique({
-        where: { id }
-      });
+    const formattedQuantity = validateAndFormatQuantity(newQuantity);
+    const changeQty = formattedQuantity - Number(inventory.quantity);
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(inventory.version ?? 1) + 1;
+    const row = {
+      ...inventory,
+      quantity: formattedQuantity,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
 
-      if (!inventory) {
-        throw new Error("Inventory record not found");
-      }
+    db.prepare(
+      `
+        UPDATE inventory
+        SET quantity = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE inventory_id = ?
+      `
+    ).run(row.quantity, row.version, row.updated_at, row.last_modified_by_device_id, id);
 
-      const changeQty = newQuantity - inventory.quantity;
+    enqueueOutbox("inventory", id, "update", row.version, row);
 
-      // Update inventory
-      const updatedInventory = await tx.inventory.update({
-        where: { id },
-        data: { quantity: newQuantity },
-        include: {
-          product: {
-            include: {
-              category: true
-            }
-          }
-        }
-      });
-
-      // Create stock transaction record
-      await tx.stockTransaction.create({
-        data: {
-          productId: inventory.productId,
-          type: changeQty >= 0 ? "IN" : "OUT",
-          changeQty,
+    const transactionId = randomUUID();
+    const timestamp = nowIso();
+    const txRow = {
+      transaction_id: transactionId,
+      product_id: inventory.product_id,
+      type: changeQty >= 0 ? "IN" : "OUT",
+      change_qty: changeQty,
+      reason,
+      transaction_date: timestamp,
+      related_invoice_id: relatedInvoiceId ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+    db.prepare(
+      `
+        INSERT INTO stock_transactions (
+          transaction_id,
+          product_id,
+          type,
+          change_qty,
           reason,
-          relatedInvoiceId
-        }
-      });
+          transaction_date,
+          related_invoice_id,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      txRow.transaction_id,
+      txRow.product_id,
+      txRow.type,
+      txRow.change_qty,
+      txRow.reason,
+      txRow.transaction_date,
+      txRow.related_invoice_id,
+      txRow.version,
+      txRow.created_at,
+      txRow.updated_at,
+      txRow.deleted_at,
+      txRow.last_modified_by_device_id
+    );
 
-      // Update Product stockLevel to match inventory
-      await updateProductStockLevel(inventory.productId, newQuantity, tx);
-
-      return updatedInventory;
-    });
+    enqueueOutbox("stock_transactions", txRow.transaction_id, "insert", txRow.version, txRow);
+    updateLocalProductStockLevel(inventory.product_id, formattedQuantity);
     clearProductCache();
-    return updatedInventory;
+
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(inventory.product_id);
+    const category = product?.category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(product.category_id)
+      : null;
+
+    return {
+      ...row,
+      product: product
+        ? {
+            ...product,
+            category
+          }
+        : null
+    };
   }
 };
 
-// Stock Sync Utility Functions
 export const stockSyncService = {
   // Sync a single product's stock level from its inventories
   syncProductStockFromInventory: async (productId: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const rows = db
+      .prepare("SELECT quantity FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+      .all(productId) as { quantity: number }[];
 
-    const totalInventory = await prisma.inventory.aggregate({
-      where: { productId },
-      _sum: { quantity: true }
-    });
+    const newStockLevel = rows.reduce(
+      (sum, row) => sum + Number(row.quantity ?? 0),
+      0
+    );
 
-    const newStockLevel = totalInventory._sum.quantity || 0;
-
-    await updateProductStockLevel(productId, newStockLevel, prisma);
-
+    updateLocalProductStockLevel(productId, newStockLevel);
+    clearProductCache();
     return newStockLevel;
   },
 
   // Sync all products' stock levels from their inventories
   syncAllProductsStockFromInventory: async () => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const productIds = db
+      .prepare("SELECT product_id FROM products WHERE deleted_at IS NULL")
+      .all() as { product_id: string }[];
 
-    const products = await prisma.product.findMany({
-      select: { id: true }
-    });
+    const totals = new Map<string, number>();
+    const inventoryRows = db
+      .prepare("SELECT product_id, quantity FROM inventory WHERE deleted_at IS NULL")
+      .all() as { product_id: string; quantity: number }[];
 
-    await runWithConcurrency(products, DEFAULT_DB_CONCURRENCY, async (product) => {
-      const totalInventory = await prisma.inventory.aggregate({
-        where: { productId: product.id },
-        _sum: { quantity: true }
-      });
+    for (const row of inventoryRows) {
+      const current = totals.get(row.product_id) ?? 0;
+      totals.set(row.product_id, current + Number(row.quantity ?? 0));
+    }
 
-      const newStockLevel = totalInventory._sum.quantity || 0;
+    for (const product of productIds) {
+      const newStockLevel = totals.get(product.product_id) ?? 0;
+      updateLocalProductStockLevel(product.product_id, newStockLevel);
+    }
 
-      return prisma.product.update({
-        where: { id: product.id },
-        data: { stockLevel: newStockLevel }
-      });
-    });
     clearProductCache();
-    return products.length;
+    return productIds.length;
   }
 };
 
 // Stock Transaction Service
 export const stockTransactionService = {
   findMany: async (filters?: StockTransactionFilters, options?: FindManyOptions) => {
-    const prisma = getPrismaClient();
-    const where = buildStockTransactionWhereClause(filters);
+    const db = getLocalDb();
+    const selectKeys =
+      options?.select && Object.keys(options.select).filter((key) => options.select?.[key]);
+    const columns = selectKeys && selectKeys.length > 0 ? selectKeys.join(", ") : "*";
 
-    const query: Record<string, unknown> = {
-      where,
-      orderBy: { transactionDate: "desc" }
-    };
+    let rows = db
+      .prepare(`SELECT ${columns} FROM stock_transactions WHERE deleted_at IS NULL`)
+      .all() as any[];
 
-    if (options?.select) {
-      query.select = options.select;
-    } else {
-      query.include = {
-        product: {
-          include: {
-            category: true
-          }
-        }
-      };
+    if (filters?.productId) {
+      rows = rows.filter((row) => row.product_id === filters.productId);
     }
 
-    applyPagination(query, options?.pagination);
-    return await prisma.stockTransaction.findMany(query as any);
+    if (filters?.reason) {
+      const reason = filters.reason.toLowerCase();
+      rows = rows.filter((row) => String(row.reason ?? "").toLowerCase().includes(reason));
+    }
+
+    if (filters?.dateFrom || filters?.dateTo) {
+      const from = filters.dateFrom ? new Date(filters.dateFrom) : null;
+      const to = filters.dateTo ? new Date(filters.dateTo) : null;
+      rows = rows.filter((row) => {
+        const date = new Date(row.transaction_date);
+        if (from && date < from) {
+          return false;
+        }
+        if (to && date > to) {
+          return false;
+        }
+        return true;
+      });
+    }
+
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
+    const productMap = new Map(products.map((product: any) => [product.product_id, product]));
+    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
+    const categoryMap = new Map(categories.map((cat: any) => [cat.category_id, cat]));
+
+    if (filters?.searchTerm) {
+      const term = filters.searchTerm.trim().toLowerCase();
+      if (term) {
+        rows = rows.filter((row) => {
+          const product = productMap.get(row.product_id);
+          return (
+            String(row.reason ?? "").toLowerCase().includes(term) ||
+            String(product?.name ?? "").toLowerCase().includes(term) ||
+            String(product?.english_name ?? "").toLowerCase().includes(term) ||
+            String(product?.sku ?? "").toLowerCase().includes(term)
+          );
+        });
+      }
+    }
+
+    rows.sort((a, b) => String(b.transaction_date).localeCompare(String(a.transaction_date)));
+
+    if (options?.pagination?.skip) {
+      rows = rows.slice(options.pagination.skip);
+    }
+    if (options?.pagination?.take) {
+      rows = rows.slice(0, options.pagination.take);
+    }
+
+    if (options?.select) {
+      return rows;
+    }
+
+    return rows.map((row) => {
+      const product = productMap.get(row.product_id);
+      return {
+        ...row,
+        product: product
+          ? {
+              ...product,
+              category: product.category_id ? categoryMap.get(product.category_id) ?? null : null
+            }
+          : null
+      };
+    });
   },
   count: async (filters?: StockTransactionFilters) => {
-    const prisma = getPrismaClient();
-    const where = buildStockTransactionWhereClause(filters);
-    return await prisma.stockTransaction.count({ where } as any);
+    const rows = await stockTransactionService.findMany(filters);
+    return rows.length;
   },
 
   create: async (data: {
@@ -2281,88 +4100,159 @@ export const stockTransactionService = {
     reason: string;
     relatedInvoiceId?: string;
   }) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(data.productId);
+    if (!product) {
+      throw new Error(`Product with ID ${data.productId} not found`);
+    }
 
-    const transaction = await prisma.$transaction(async (tx) => {
-      // Format changeQty to 3 decimal places
-      const formattedChangeQty = validateAndFormatQuantity(data.changeQty);
+    const formattedChangeQty = validateAndFormatQuantity(data.changeQty);
+    const deviceId = ensureDeviceId();
 
-      // Validate that the product exists
-      const product = await tx.product.findUnique({
-        where: { id: data.productId }
-      });
+    let inventory = db
+      .prepare("SELECT * FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+      .get(data.productId);
 
-      if (!product) {
-        throw new Error(`Product with ID ${data.productId} not found`);
+    if (!inventory) {
+      const timestamp = nowIso();
+      const initialQuantity = Math.max(0, formattedChangeQty);
+      const inventoryRow = {
+        inventory_id: randomUUID(),
+        product_id: data.productId,
+        quantity: initialQuantity,
+        reorder_level: 5,
+        batch_number: null,
+        expiry_date: null,
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp,
+        deleted_at: null,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          INSERT INTO inventory (
+            inventory_id,
+            product_id,
+            quantity,
+            reorder_level,
+            batch_number,
+            expiry_date,
+            version,
+            created_at,
+            updated_at,
+            deleted_at,
+            last_modified_by_device_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      ).run(
+        inventoryRow.inventory_id,
+        inventoryRow.product_id,
+        inventoryRow.quantity,
+        inventoryRow.reorder_level,
+        inventoryRow.batch_number,
+        inventoryRow.expiry_date,
+        inventoryRow.version,
+        inventoryRow.created_at,
+        inventoryRow.updated_at,
+        inventoryRow.deleted_at,
+        inventoryRow.last_modified_by_device_id
+      );
+      enqueueOutbox("inventory", inventoryRow.inventory_id, "insert", inventoryRow.version, inventoryRow);
+      inventory = inventoryRow
+    } else {
+      const newQuantity = Math.max(0, Number(inventory.quantity) + formattedChangeQty);
+      if (newQuantity < 0 && formattedChangeQty < 0) {
+        throw new Error(
+          `Insufficient stock. Current: ${inventory.quantity}, Requested change: ${formattedChangeQty}`
+        );
       }
+      const updatedAt = nowIso();
+      const version = Number(inventory.version ?? 1) + 1;
+      const updatedInventory = {
+        ...inventory,
+        quantity: newQuantity,
+        version,
+        updated_at: updatedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE inventory
+          SET quantity = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE inventory_id = ?
+        `
+      ).run(
+        updatedInventory.quantity,
+        updatedInventory.version,
+        updatedInventory.updated_at,
+        updatedInventory.last_modified_by_device_id,
+        updatedInventory.inventory_id
+      );
+      enqueueOutbox("inventory", inventory.inventory_id, "update", updatedInventory.version, updatedInventory);
+      inventory = updatedInventory
+    }
 
-      // First, check if inventory record exists for this product
-      let inventory = await tx.inventory.findFirst({
-        where: {
-          productId: data.productId
-        }
-      });
+    const timestamp = nowIso();
+    const transactionRow = {
+      transaction_id: randomUUID(),
+      product_id: data.productId,
+      type: data.type,
+      change_qty: formattedChangeQty,
+      reason: data.reason,
+      transaction_date: timestamp,
+      related_invoice_id: data.relatedInvoiceId ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
 
-      // If no inventory record exists, create one
-      if (!inventory) {
-        const initialQuantity = Math.max(0, formattedChangeQty);
-        inventory = await tx.inventory.create({
-          data: {
-            productId: data.productId,
-            quantity: initialQuantity,
-            reorderLevel: 5 // Default reorder level
-          }
-        });
-      } else {
-        // Update existing inventory
-        const newQuantity = Math.max(0, inventory.quantity + formattedChangeQty);
+    db.prepare(
+      `
+        INSERT INTO stock_transactions (
+          transaction_id,
+          product_id,
+          type,
+          change_qty,
+          reason,
+          transaction_date,
+          related_invoice_id,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      transactionRow.transaction_id,
+      transactionRow.product_id,
+      transactionRow.type,
+      transactionRow.change_qty,
+      transactionRow.reason,
+      transactionRow.transaction_date,
+      transactionRow.related_invoice_id,
+      transactionRow.version,
+      transactionRow.created_at,
+      transactionRow.updated_at,
+      transactionRow.deleted_at,
+      transactionRow.last_modified_by_device_id
+    );
 
-        // Prevent negative stock unless it's a valid adjustment
-        if (newQuantity < 0 && formattedChangeQty < 0) {
-          throw new Error(
-            `Insufficient stock. Current: ${inventory.quantity}, Requested change: ${formattedChangeQty}`
-          );
-        }
-
-        await tx.inventory.update({
-          where: { id: inventory.id },
-          data: { quantity: newQuantity }
-        });
-      }
-
-      // Create the stock transaction record
-      const transaction = await tx.stockTransaction.create({
-        data: {
-          ...data,
-          changeQty: formattedChangeQty,
-          transactionDate: new Date() // Ensure current timestamp
-        },
-        include: {
-          product: {
-            include: {
-              category: true
-            }
-          }
-        }
-      });
-
-      // Update Product stockLevel to reflect total inventory
-      const totalInventory = await tx.inventory.aggregate({
-        where: { productId: data.productId },
-        _sum: { quantity: true }
-      });
-
-      const newProductStockLevel = totalInventory._sum.quantity || 0;
-
-      await tx.product.update({
-        where: { id: data.productId },
-        data: { stockLevel: newProductStockLevel }
-      });
-
-      return transaction;
-    });
+    enqueueOutbox("stock_transactions", transactionRow.transaction_id, "insert", transactionRow.version, transactionRow);
+    updateLocalProductStockLevel(data.productId, Number(inventory.quantity));
     clearProductCache();
-    return transaction;
+
+    return {
+      ...transactionRow,
+      product
+    };
   },
 
   update: async (
@@ -2374,220 +4264,256 @@ export const stockTransactionService = {
       relatedInvoiceId?: string;
     }
   ) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM stock_transactions WHERE transaction_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Stock transaction not found");
+    }
 
-    const transaction = await prisma.$transaction(async (tx) => {
-      // Get the existing transaction
-      const existingTransaction = await tx.stockTransaction.findUnique({
-        where: { id },
-        include: {
-          product: true
-        }
-      });
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const changeQty =
+      data.changeQty !== undefined
+        ? validateAndFormatQuantity(data.changeQty)
+        : Number(existing.change_qty);
 
-      if (!existingTransaction) {
-        throw new Error("Stock transaction not found");
+    if (data.changeQty !== undefined && changeQty != Number(existing.change_qty)) {
+      const inventory = db
+        .prepare("SELECT * FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+        .get(existing.product_id);
+      if (inventory) {
+        const quantityDifference = changeQty - Number(existing.change_qty);
+        const newQuantity = Math.max(0, Number(inventory.quantity) + quantityDifference);
+        const invUpdatedAt = nowIso();
+        const invVersion = Number(inventory.version ?? 1) + 1;
+        const updatedInventory = {
+          ...inventory,
+          quantity: newQuantity,
+          version: invVersion,
+          updated_at: invUpdatedAt,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            UPDATE inventory
+            SET quantity = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+            WHERE inventory_id = ?
+          `
+        ).run(
+          updatedInventory.quantity,
+          updatedInventory.version,
+          updatedInventory.updated_at,
+          updatedInventory.last_modified_by_device_id,
+          updatedInventory.inventory_id
+        );
+        enqueueOutbox("inventory", updatedInventory.inventory_id, "update", updatedInventory.version, updatedInventory);
+        updateLocalProductStockLevel(existing.product_id, updatedInventory.quantity);
       }
+    }
 
-      // If changeQty is being updated, we need to adjust the inventory
-      if (data.changeQty !== undefined && data.changeQty !== existingTransaction.changeQty) {
-        const inventory = await tx.inventory.findFirst({
-          where: {
-            productId: existingTransaction.productId
-          }
-        });
+    const row = {
+      ...existing,
+      type: data.type ?? existing.type,
+      change_qty: changeQty,
+      reason: data.reason ?? existing.reason,
+      related_invoice_id: data.relatedInvoiceId ?? existing.related_invoice_id,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
 
-        if (inventory) {
-          // Reverse the old change and apply the new change
-          const quantityDifference = data.changeQty - existingTransaction.changeQty;
-          const newQuantity = Math.max(0, inventory.quantity + quantityDifference);
+    db.prepare(
+      `
+        UPDATE stock_transactions
+        SET type = ?, change_qty = ?, reason = ?, related_invoice_id = ?,
+            version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE transaction_id = ?
+      `
+    ).run(
+      row.type,
+      row.change_qty,
+      row.reason,
+      row.related_invoice_id,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
 
-          await tx.inventory.update({
-            where: { id: inventory.id },
-            data: { quantity: newQuantity }
-          });
-
-          // Update Product stockLevel
-          const totalInventory = await tx.inventory.aggregate({
-            where: { productId: existingTransaction.productId },
-            _sum: { quantity: true }
-          });
-
-          await tx.product.update({
-            where: { id: existingTransaction.productId },
-            data: { stockLevel: totalInventory._sum.quantity || 0 }
-          });
-        }
-      }
-
-      // Update the transaction
-      return await tx.stockTransaction.update({
-        where: { id },
-        data,
-        include: {
-          product: {
-            include: {
-              category: true
-            }
-          }
-        }
-      });
-    });
+    enqueueOutbox("stock_transactions", id, "update", row.version, row);
     clearProductCache();
-    return transaction;
+    return row;
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM stock_transactions WHERE transaction_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Stock transaction not found");
+    }
 
-    const deletedTransaction = await prisma.$transaction(async (tx) => {
-      // Get the transaction to be deleted
-      const transaction = await tx.stockTransaction.findUnique({
-        where: { id },
-        include: {
-          product: true
-        }
-      });
+    const inventory = db
+      .prepare("SELECT * FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+      .get(existing.product_id);
+    if (inventory) {
+      const newQuantity = Math.max(0, Number(inventory.quantity) - Number(existing.change_qty));
+      const invUpdatedAt = nowIso();
+      const invVersion = Number(inventory.version ?? 1) + 1;
+      const updatedInventory = {
+        ...inventory,
+        quantity: newQuantity,
+        version: invVersion,
+        updated_at: invUpdatedAt,
+        last_modified_by_device_id: ensureDeviceId()
+      };
+      db.prepare(
+        `
+          UPDATE inventory
+          SET quantity = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE inventory_id = ?
+        `
+      ).run(
+        updatedInventory.quantity,
+        updatedInventory.version,
+        updatedInventory.updated_at,
+        updatedInventory.last_modified_by_device_id,
+        updatedInventory.inventory_id
+      );
+      enqueueOutbox("inventory", updatedInventory.inventory_id, "update", updatedInventory.version, updatedInventory);
+      updateLocalProductStockLevel(existing.product_id, updatedInventory.quantity);
+    }
 
-      if (!transaction) {
-        throw new Error("Stock transaction not found");
-      }
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: ensureDeviceId()
+    };
 
-      // Reverse the transaction's effect on inventory
-      const inventory = await tx.inventory.findFirst({
-        where: {
-          productId: transaction.productId
-        }
-      });
+    db.prepare(
+      `
+        UPDATE stock_transactions
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE transaction_id = ?
+      `
+    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
 
-      if (inventory) {
-        // Reverse the change
-        const newQuantity = Math.max(0, inventory.quantity - transaction.changeQty);
-
-        await tx.inventory.update({
-          where: { id: inventory.id },
-          data: { quantity: newQuantity }
-        });
-
-        // Update Product stockLevel
-        const totalInventory = await tx.inventory.aggregate({
-          where: { productId: transaction.productId },
-          _sum: { quantity: true }
-        });
-
-        await tx.product.update({
-          where: { id: transaction.productId },
-          data: { stockLevel: totalInventory._sum.quantity || 0 }
-        });
-      }
-
-      // Delete the transaction
-      return await tx.stockTransaction.delete({
-        where: { id }
-      });
-    });
+    enqueueOutbox("stock_transactions", id, "delete", row.version, row);
     clearProductCache();
-    return deletedTransaction;
+    return row;
   },
 
-  // Enhanced method: Get stock movement analytics
   getStockMovementAnalytics: async (filters?: {
     productId?: string;
     dateFrom?: Date;
     dateTo?: Date;
   }) => {
-    const prisma = getPrismaClient();
-    const where: Record<string, unknown> = {};
-
-    if (filters?.productId) {
-      where.productId = filters.productId;
-    }
-
-    if (filters?.dateFrom || filters?.dateTo) {
-      const dateFilter: Record<string, Date> = {};
-      if (filters.dateFrom) {
-        dateFilter.gte = filters.dateFrom;
-      }
-      if (filters.dateTo) {
-        dateFilter.lte = filters.dateTo;
-      }
-      where.transactionDate = dateFilter;
-    }
-
-    const transactions = await prisma.stockTransaction.findMany({
-      where,
-      include: {
-        product: {
-          include: {
-            category: true
-          }
-        }
-      },
-      orderBy: { transactionDate: "desc" }
+    const rows = await stockTransactionService.findMany({
+      productId: filters?.productId,
+      dateFrom: filters?.dateFrom,
+      dateTo: filters?.dateTo
     });
 
-    // Calculate analytics
     const analytics = {
-      totalTransactions: transactions.length,
-      totalStockIn: transactions
-        .filter((t) => t.changeQty > 0)
-        .reduce((sum, t) => sum + t.changeQty, 0),
-      totalStockOut: transactions
-        .filter((t) => t.changeQty < 0)
-        .reduce((sum, t) => sum + Math.abs(t.changeQty), 0),
-      netChange: transactions.reduce((sum, t) => sum + t.changeQty, 0),
-      reasonBreakdown: transactions.reduce(
-        (acc, t) => {
-          acc[t.reason] = (acc[t.reason] || 0) + Math.abs(t.changeQty);
-          return acc;
-        },
-        {} as Record<string, number>
-      ),
-      typeBreakdown: transactions.reduce(
-        (acc, t) => {
-          if (!acc[t.type]) {
-            acc[t.type] = { count: 0, totalQuantity: 0 };
+      totalTransactions: rows.length,
+      totalStockIn: rows
+        .filter((t: any) => Number(t.change_qty) > 0)
+        .reduce((sum: number, t: any) => sum + Number(t.change_qty), 0),
+      totalStockOut: rows
+        .filter((t: any) => Number(t.change_qty) < 0)
+        .reduce((sum: number, t: any) => sum + Math.abs(Number(t.change_qty)), 0),
+      netChange: rows.reduce((sum: number, t: any) => sum + Number(t.change_qty), 0),
+      reasonBreakdown: rows.reduce((acc: Record<string, number>, t: any) => {
+        const key = t.reason ?? "unknown";
+        acc[key] = (acc[key] || 0) + Math.abs(Number(t.change_qty));
+        return acc;
+      }, {}),
+      typeBreakdown: rows.reduce(
+        (acc: Record<string, { count: number; totalQuantity: number }>, t: any) => {
+          const key = t.type ?? "unknown";
+          if (!acc[key]) {
+            acc[key] = { count: 0, totalQuantity: 0 };
           }
-          acc[t.type].count += 1;
-          acc[t.type].totalQuantity += Math.abs(t.changeQty);
+          acc[key].count += 1;
+          acc[key].totalQuantity += Math.abs(Number(t.change_qty));
           return acc;
         },
-        {} as Record<string, { count: number; totalQuantity: number }>
+        {}
       )
     };
 
-    return { transactions, analytics };
+    return { transactions: rows, analytics };
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.stockTransaction.findUnique({
-      where: { id },
-      include: {
-        product: {
-          include: {
-            category: true
+    const db = getLocalDb();
+    const row = db
+      .prepare("SELECT * FROM stock_transactions WHERE transaction_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!row) {
+      return null;
+    }
+
+    const product = db
+      .prepare("SELECT * FROM products WHERE product_id = ? AND deleted_at IS NULL")
+      .get(row.product_id);
+    const category = product?.category_id
+      ? db
+          .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
+          .get(product.category_id)
+      : null;
+
+    return {
+      ...row,
+      product: product
+        ? {
+            ...product,
+            category
           }
-        }
-      }
-    });
+        : null
+    };
   }
 };
 
 // Supplier Service
 export const supplierService = {
   findMany: async () => {
-    const prisma = getPrismaClient();
-    return await prisma.supplier.findMany({
-      include: {
-        purchaseOrders: {
-          include: {
-            items: true
-          }
-        }
-      },
-      orderBy: { createdAt: "desc" }
-    });
+    const db = getLocalDb();
+    const suppliers = db
+      .prepare("SELECT * FROM suppliers WHERE deleted_at IS NULL ORDER BY created_at DESC")
+      .all() as any[];
+
+    const supplierIds = suppliers.map((row) => row.supplier_id);
+    const purchaseOrders = supplierIds.length
+      ? db
+          .prepare(
+            `
+              SELECT * FROM purchase_orders
+              WHERE deleted_at IS NULL AND supplier_id IN (${supplierIds.map(() => "?").join(", ")})
+            `
+          )
+          .all(...supplierIds)
+      : [];
+
+    const poMap = new Map();
+    for (const po of purchaseOrders) {
+      const list = poMap.get(po.supplier_id) ?? [];
+      list.push(po);
+      poMap.set(po.supplier_id, list);
+    }
+
+    return suppliers.map((supplier) => ({
+      ...supplier,
+      purchaseOrders: poMap.get(supplier.supplier_id) ?? []
+    }));
   },
 
   create: async (data: {
@@ -2597,27 +4523,68 @@ export const supplierService = {
     email?: string;
     address?: string;
   }) => {
-    const prisma = getPrismaClient();
-
-    // Check for duplicate name
-    const existing = await prisma.supplier.findFirst({
-      where: {
-        name: {
-          equals: data.name
-        }
-      }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT supplier_id FROM suppliers WHERE name = ? AND deleted_at IS NULL")
+      .get(data.name);
 
     if (existing) {
       throw new Error(`Supplier with name "${data.name}" already exists`);
     }
 
-    return await prisma.supplier.create({
-      data,
-      include: {
-        purchaseOrders: true
-      }
-    });
+    const supplierId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      supplier_id: supplierId,
+      name: data.name,
+      contact_name: data.contactName ?? null,
+      phone: data.phone ?? null,
+      email: data.email ?? null,
+      address: data.address ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO suppliers (
+          supplier_id,
+          name,
+          contact_name,
+          phone,
+          email,
+          address,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.supplier_id,
+      row.name,
+      row.contact_name,
+      row.phone,
+      row.email,
+      row.address,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox("suppliers", row.supplier_id, "insert", row.version, row);
+    return {
+      ...row,
+      purchaseOrders: []
+    };
   },
 
   update: async (
@@ -2630,89 +4597,210 @@ export const supplierService = {
       address?: string;
     }
   ) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM suppliers WHERE supplier_id = ? AND deleted_at IS NULL")
+      .get(id);
 
-    // Check for duplicate name if name is being updated
+    if (!existing) {
+      throw new Error("Supplier not found");
+    }
+
     if (data.name) {
-      const existing = await prisma.supplier.findFirst({
-        where: {
-          name: {
-            equals: data.name
-          },
-          NOT: { id }
-        }
-      });
-
-      if (existing) {
+      const duplicate = db
+        .prepare("SELECT supplier_id FROM suppliers WHERE name = ? AND supplier_id != ? AND deleted_at IS NULL")
+        .get(data.name, id);
+      if (duplicate) {
         throw new Error(`Supplier with name "${data.name}" already exists`);
       }
     }
 
-    return await prisma.supplier.update({
-      where: { id },
-      data,
-      include: {
-        purchaseOrders: true
-      }
-    });
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      name: data.name ?? existing.name,
+      contact_name: data.contactName ?? existing.contact_name,
+      phone: data.phone ?? existing.phone,
+      email: data.email ?? existing.email,
+      address: data.address ?? existing.address,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE suppliers
+        SET name = ?, contact_name = ?, phone = ?, email = ?, address = ?,
+            version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE supplier_id = ?
+      `
+    ).run(
+      row.name,
+      row.contact_name,
+      row.phone,
+      row.email,
+      row.address,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("suppliers", id, "update", row.version, row);
+
+    const purchaseOrders = db
+      .prepare("SELECT * FROM purchase_orders WHERE supplier_id = ? AND deleted_at IS NULL")
+      .all(id);
+
+    return {
+      ...row,
+      purchaseOrders
+    };
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.supplier.delete({
-      where: { id }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM suppliers WHERE supplier_id = ? AND deleted_at IS NULL")
+      .get(id);
+
+    if (!existing) {
+      throw new Error("Supplier not found");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE suppliers
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE supplier_id = ?
+      `
+    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
+
+    enqueueOutbox("suppliers", id, "delete", row.version, row);
+    return row;
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.supplier.findUnique({
-      where: { id },
-      include: {
-        purchaseOrders: {
-          include: {
-            items: {
-              include: {
-                product: true
-              }
-            }
-          }
-        }
-      }
-    });
+    const db = getLocalDb();
+    const supplier = db
+      .prepare("SELECT * FROM suppliers WHERE supplier_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!supplier) {
+      return null;
+    }
+
+    const purchaseOrders = db
+      .prepare(
+        "SELECT * FROM purchase_orders WHERE supplier_id = ? AND deleted_at IS NULL ORDER BY order_date DESC"
+      )
+      .all(id);
+
+    const poIds = purchaseOrders.map((po) => po.po_id);
+    const items = poIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM purchase_order_items WHERE po_id IN (${poIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...poIds)
+      : [];
+
+    const itemMap = new Map();
+    for (const item of items) {
+      const list = itemMap.get(item.po_id) ?? [];
+      list.push(item);
+      itemMap.set(item.po_id, list);
+    }
+
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
+    const productMap = new Map(products.map((product) => [product.product_id, product]));
+
+    return {
+      ...supplier,
+      purchaseOrders: purchaseOrders.map((po) => ({
+        ...po,
+        items: (itemMap.get(po.po_id) ?? []).map((item) => ({
+          ...item,
+          product: productMap.get(item.product_id) ?? null
+        }))
+      }))
+    };
   }
 };
 
 // Purchase Order Service
 export const purchaseOrderService = {
   findMany: async (filters?: { supplierId?: string; status?: string }) => {
-    const prisma = getPrismaClient();
-    const where: Record<string, unknown> = {};
+    const db = getLocalDb();
+    let rows = db
+      .prepare("SELECT * FROM purchase_orders WHERE deleted_at IS NULL ORDER BY order_date DESC")
+      .all() as any[];
 
     if (filters?.supplierId) {
-      where.supplierId = filters.supplierId;
+      rows = rows.filter((row) => row.supplier_id == filters.supplierId);
     }
 
     if (filters?.status) {
-      where.status = filters.status;
+      rows = rows.filter((row) => row.status == filters.status);
     }
 
-    return await prisma.purchaseOrder.findMany({
-      where,
-      include: {
-        supplier: true,
-        items: {
-          include: {
-            product: {
-              include: {
-                category: true
-              }
+    const supplierIds = rows.map((row) => row.supplier_id);
+    const suppliers = supplierIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM suppliers WHERE supplier_id IN (${supplierIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...supplierIds)
+      : [];
+    const supplierMap = new Map(suppliers.map((supplier) => [supplier.supplier_id, supplier]));
+
+    const poIds = rows.map((row) => row.po_id);
+    const items = poIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM purchase_order_items WHERE po_id IN (${poIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...poIds)
+      : [];
+
+    const itemMap = new Map();
+    for (const item of items) {
+      const list = itemMap.get(item.po_id) ?? [];
+      list.push(item);
+      itemMap.set(item.po_id, list);
+    }
+
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
+    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
+    const productMap = new Map(products.map((product) => [product.product_id, product]));
+    const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
+
+    return rows.map((row) => ({
+      ...row,
+      supplier: supplierMap.get(row.supplier_id) ?? null,
+      items: (itemMap.get(row.po_id) ?? []).map((item) => ({
+        ...item,
+        product: item.product_id
+          ? {
+              ...productMap.get(item.product_id),
+              category: categoryMap.get(productMap.get(item.product_id)?.category_id) ?? null
             }
-          }
-        }
-      },
-      orderBy: { orderDate: "desc" }
-    });
+          : null
+      }))
+    }));
   },
 
   create: async (data: {
@@ -2725,50 +4813,117 @@ export const purchaseOrderService = {
       unitPrice: number;
     }>;
   }) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const supplier = db
+      .prepare("SELECT * FROM suppliers WHERE supplier_id = ? AND deleted_at IS NULL")
+      .get(data.supplierId);
+    if (!supplier) {
+      throw new Error("Supplier not found");
+    }
 
-    return await prisma.$transaction(async (tx) => {
-      // Calculate total amount
-      const totalAmount = data.items.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0);
+    const totalAmount = data.items.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0);
+    const poId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const poRow = {
+      po_id: poId,
+      supplier_id: data.supplierId,
+      order_date: data.orderDate.toISOString(),
+      status: data.status,
+      total_amount: totalAmount,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
 
-      // Create purchase order
-      const purchaseOrder = await tx.purchaseOrder.create({
-        data: {
-          supplierId: data.supplierId,
-          orderDate: data.orderDate,
-          status: data.status,
-          totalAmount
-        }
-      });
+    db.prepare(
+      `
+        INSERT INTO purchase_orders (
+          po_id,
+          supplier_id,
+          order_date,
+          status,
+          total_amount,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      poRow.po_id,
+      poRow.supplier_id,
+      poRow.order_date,
+      poRow.status,
+      poRow.total_amount,
+      poRow.version,
+      poRow.created_at,
+      poRow.updated_at,
+      poRow.deleted_at,
+      poRow.last_modified_by_device_id
+    );
 
-      // Create purchase order items with capped concurrency
-      await runWithConcurrency(data.items, DEFAULT_DB_CONCURRENCY, (item) =>
-        tx.purchaseOrderItem.create({
-          data: {
-            poId: purchaseOrder.id,
-            productId: item.productId,
-            quantity: item.quantity,
-            unitPrice: item.unitPrice
-          }
-        })
+    enqueueOutbox("purchase_orders", poRow.po_id, "insert", poRow.version, poRow);
+
+    const items: any[] = [];
+    for (const item of data.items) {
+      const itemRow = {
+        po_item_id: randomUUID(),
+        po_id: poId,
+        product_id: item.productId,
+        quantity: item.quantity,
+        unit_price: item.unitPrice,
+        received_date: null,
+        version: 1,
+        created_at: timestamp,
+        updated_at: timestamp,
+        deleted_at: null,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          INSERT INTO purchase_order_items (
+            po_item_id,
+            po_id,
+            product_id,
+            quantity,
+            unit_price,
+            received_date,
+            version,
+            created_at,
+            updated_at,
+            deleted_at,
+            last_modified_by_device_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      ).run(
+        itemRow.po_item_id,
+        itemRow.po_id,
+        itemRow.product_id,
+        itemRow.quantity,
+        itemRow.unit_price,
+        itemRow.received_date,
+        itemRow.version,
+        itemRow.created_at,
+        itemRow.updated_at,
+        itemRow.deleted_at,
+        itemRow.last_modified_by_device_id
       );
 
-      return await tx.purchaseOrder.findUnique({
-        where: { id: purchaseOrder.id },
-        include: {
-          supplier: true,
-          items: {
-            include: {
-              product: {
-                include: {
-                  category: true
-                }
-              }
-            }
-          }
-        }
-      });
-    });
+      enqueueOutbox("purchase_order_items", itemRow.po_item_id, "insert", itemRow.version, itemRow);
+      items.push(itemRow);
+    }
+
+    return {
+      ...poRow,
+      supplier,
+      items
+    };
   },
 
   update: async (
@@ -2778,108 +4933,231 @@ export const purchaseOrderService = {
       orderDate?: Date;
     }
   ) => {
-    const prisma = getPrismaClient();
-    return await prisma.purchaseOrder.update({
-      where: { id },
-      data,
-      include: {
-        supplier: true,
-        items: {
-          include: {
-            product: {
-              include: {
-                category: true
-              }
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM purchase_orders WHERE po_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Purchase order not found");
+    }
+
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      status: data.status ?? existing.status,
+      order_date: data.orderDate ? data.orderDate.toISOString() : existing.order_date,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE purchase_orders
+        SET status = ?, order_date = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE po_id = ?
+      `
+    ).run(
+      row.status,
+      row.order_date,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("purchase_orders", id, "update", row.version, row);
+
+    const supplier = db
+      .prepare("SELECT * FROM suppliers WHERE supplier_id = ? AND deleted_at IS NULL")
+      .get(row.supplier_id);
+    const items = db
+      .prepare("SELECT * FROM purchase_order_items WHERE po_id = ? AND deleted_at IS NULL")
+      .all(id);
+
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
+    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
+    const productMap = new Map(products.map((product) => [product.product_id, product]));
+    const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
+
+    return {
+      ...row,
+      supplier,
+      items: items.map((item) => ({
+        ...item,
+        product: item.product_id
+          ? {
+              ...productMap.get(item.product_id),
+              category: categoryMap.get(productMap.get(item.product_id)?.category_id) ?? null
             }
-          }
-        }
-      }
-    });
+          : null
+      }))
+    };
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM purchase_orders WHERE po_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Purchase order not found");
+    }
 
-    return await prisma.$transaction(async (tx) => {
-      // First delete all purchase order items
-      await tx.purchaseOrderItem.deleteMany({
-        where: { poId: id }
-      });
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
 
-      // Then delete the purchase order
-      return await tx.purchaseOrder.delete({
-        where: { id }
-      });
-    });
+    db.prepare(
+      `
+        UPDATE purchase_orders
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE po_id = ?
+      `
+    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
+
+    enqueueOutbox("purchase_orders", id, "delete", row.version, row);
+
+    const items = db
+      .prepare("SELECT * FROM purchase_order_items WHERE po_id = ? AND deleted_at IS NULL")
+      .all(id);
+    for (const item of items) {
+      const itemDeletedAt = nowIso();
+      const itemVersion = Number(item.version ?? 1) + 1;
+      const itemRow = {
+        ...item,
+        deleted_at: itemDeletedAt,
+        version: itemVersion,
+        updated_at: itemDeletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE purchase_order_items
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE po_item_id = ?
+        `
+      ).run(itemRow.deleted_at, itemRow.version, itemRow.updated_at, itemRow.last_modified_by_device_id, itemRow.po_item_id);
+      enqueueOutbox("purchase_order_items", itemRow.po_item_id, "delete", itemRow.version, itemRow);
+    }
+
+    return row;
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.purchaseOrder.findUnique({
-      where: { id },
-      include: {
-        supplier: true,
-        items: {
-          include: {
-            product: {
-              include: {
-                category: true
-              }
+    const db = getLocalDb();
+    const po = db
+      .prepare("SELECT * FROM purchase_orders WHERE po_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!po) {
+      return null;
+    }
+
+    const supplier = db
+      .prepare("SELECT * FROM suppliers WHERE supplier_id = ? AND deleted_at IS NULL")
+      .get(po.supplier_id);
+
+    const items = db
+      .prepare("SELECT * FROM purchase_order_items WHERE po_id = ? AND deleted_at IS NULL")
+      .all(id);
+
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
+    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
+    const productMap = new Map(products.map((product) => [product.product_id, product]));
+    const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
+
+    return {
+      ...po,
+      supplier,
+      items: items.map((item) => ({
+        ...item,
+        product: item.product_id
+          ? {
+              ...productMap.get(item.product_id),
+              category: categoryMap.get(productMap.get(item.product_id)?.category_id) ?? null
             }
-          }
-        }
-      }
-    });
+          : null
+      }))
+    };
   },
 
   receiveItems: async (
     id: string,
     receivedItems: Array<{ itemId: string; receivedDate: Date }>
   ) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const deviceId = ensureDeviceId();
 
-    return await prisma.$transaction(async (tx) => {
-      // Update received dates for items with capped concurrency
-      await runWithConcurrency(receivedItems, DEFAULT_DB_CONCURRENCY, (item) =>
-        tx.purchaseOrderItem.update({
-          where: { id: item.itemId },
-          data: { receivedDate: item.receivedDate }
-        })
-      );
-
-      // Check if all items are received
-      const purchaseOrder = await tx.purchaseOrder.findUnique({
-        where: { id },
-        include: { items: true }
-      });
-
-      if (purchaseOrder) {
-        const allReceived = purchaseOrder.items.every((item) => item.receivedDate !== null);
-
-        if (allReceived) {
-          await tx.purchaseOrder.update({
-            where: { id },
-            data: { status: "completed" }
-          });
-        }
+    for (const item of receivedItems) {
+      const existing = db
+        .prepare("SELECT * FROM purchase_order_items WHERE po_item_id = ? AND deleted_at IS NULL")
+        .get(item.itemId);
+      if (!existing) {
+        continue;
       }
 
-      return await tx.purchaseOrder.findUnique({
-        where: { id },
-        include: {
-          supplier: true,
-          items: {
-            include: {
-              product: {
-                include: {
-                  category: true
-                }
-              }
-            }
-          }
-        }
-      });
-    });
+      const updatedAt = nowIso();
+      const version = Number(existing.version ?? 1) + 1;
+      const row = {
+        ...existing,
+        received_date: item.receivedDate.toISOString(),
+        version,
+        updated_at: updatedAt,
+        last_modified_by_device_id: deviceId
+      };
+
+      db.prepare(
+        `
+          UPDATE purchase_order_items
+          SET received_date = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE po_item_id = ?
+        `
+      ).run(row.received_date, row.version, row.updated_at, row.last_modified_by_device_id, row.po_item_id);
+
+      enqueueOutbox("purchase_order_items", row.po_item_id, "update", row.version, row);
+    }
+
+    const items = db
+      .prepare("SELECT * FROM purchase_order_items WHERE po_id = ? AND deleted_at IS NULL")
+      .all(id);
+
+    const allReceived = items.length > 0 && items.every((item: any) => item.received_date);
+
+    if (allReceived) {
+      const po = db
+        .prepare("SELECT * FROM purchase_orders WHERE po_id = ? AND deleted_at IS NULL")
+        .get(id);
+      if (po) {
+        const updatedAt = nowIso();
+        const version = Number(po.version ?? 1) + 1;
+        const row = {
+          ...po,
+          status: "completed",
+          version,
+          updated_at: updatedAt,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            UPDATE purchase_orders
+            SET status = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+            WHERE po_id = ?
+          `
+        ).run(row.status, row.version, row.updated_at, row.last_modified_by_device_id, id);
+        enqueueOutbox("purchase_orders", id, "update", row.version, row);
+      }
+    }
+
+    return await purchaseOrderService.findById(id);
   }
 };
 
@@ -2890,29 +5168,79 @@ export const paymentService = {
     dateFrom?: Date;
     dateTo?: Date;
   }) => {
-    const prisma = getPrismaClient();
-    return await prisma.payment.findMany({
-      where: {
-        ...(filters?.invoiceId && { invoiceId: filters.invoiceId }),
-        ...(filters?.customerId && { customerId: filters.customerId }),
-        ...(filters?.dateFrom || filters?.dateTo
-          ? {
-              createdAt: {
-                ...(filters.dateFrom && { gte: filters.dateFrom }),
-                ...(filters.dateTo && { lte: filters.dateTo })
-              }
-            }
-          : {})
-      },
-      include: {
-        invoice: {
-          include: {
-            customer: true,
-            employee: true
-          }
+    const db = getLocalDb();
+    let rows = db
+      .prepare("SELECT * FROM payments WHERE deleted_at IS NULL ORDER BY created_at DESC")
+      .all() as any[];
+
+    if (filters?.invoiceId) {
+      rows = rows.filter((row) => row.invoice_id === filters.invoiceId);
+    }
+
+    if (filters?.dateFrom || filters?.dateTo) {
+      const from = filters.dateFrom ? new Date(filters.dateFrom) : null;
+      const to = filters.dateTo ? new Date(filters.dateTo) : null;
+      rows = rows.filter((row) => {
+        const date = new Date(row.created_at);
+        if (from && date < from) {
+          return false;
         }
-      },
-      orderBy: { createdAt: "desc" }
+        if (to && date > to) {
+          return false;
+        }
+        return true;
+      });
+    }
+
+    const invoiceIds = rows.map((row) => row.invoice_id);
+    const invoices = invoiceIds.length
+      ? db
+          .prepare(
+            `SELECT * FROM sales_invoices WHERE invoice_id IN (${invoiceIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...invoiceIds)
+      : [];
+    const invoiceMap = new Map(invoices.map((invoice) => [invoice.invoice_id, invoice]));
+
+    if (filters?.customerId) {
+      rows = rows.filter((row) => {
+        const invoice = invoiceMap.get(row.invoice_id);
+        return invoice?.customer_id === filters.customerId;
+      });
+    }
+
+    const employeeIds = invoices.map((invoice) => invoice.employee_id).filter(Boolean);
+    const employees = employeeIds.length
+      ? db
+          .prepare(
+            `SELECT id, name, email FROM employee WHERE id IN (${employeeIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...employeeIds)
+      : [];
+    const employeeMap = new Map(employees.map((employee) => [employee.id, employee]));
+
+    const customerIds = invoices.map((invoice) => invoice.customer_id).filter(Boolean);
+    const customers = customerIds.length
+      ? db
+          .prepare(
+            `SELECT customer_id, name, email FROM customers WHERE customer_id IN (${customerIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
+          )
+          .all(...customerIds)
+      : [];
+    const customerMap = new Map(customers.map((customer) => [customer.customer_id, customer]));
+
+    return rows.map((row) => {
+      const invoice = invoiceMap.get(row.invoice_id);
+      return {
+        ...row,
+        invoice: invoice
+          ? {
+              ...invoice,
+              customer: invoice.customer_id ? customerMap.get(invoice.customer_id) ?? null : null,
+              employee: invoice.employee_id ? employeeMap.get(invoice.employee_id) ?? null : null
+            }
+          : null
+      };
     });
   },
 
@@ -2923,143 +5251,192 @@ export const paymentService = {
     employeeId: string;
     notes?: string;
   }) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const invoice = db
+      .prepare("SELECT * FROM sales_invoices WHERE invoice_id = ? AND deleted_at IS NULL")
+      .get(data.invoiceId);
+    if (!invoice) {
+      throw new Error("Invoice not found");
+    }
 
-    return await prisma.$transaction(async (tx) => {
-      const payment = await tx.payment.create({
-        data: {
-          invoiceId: data.invoiceId,
-          amount: data.amount,
-          paymentMode: data.paymentMode,
-          employeeId: data.employeeId,
-          notes: data.notes
-        }
-      });
+    const paymentId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      payment_id: paymentId,
+      invoice_id: data.invoiceId,
+      amount: data.amount,
+      payment_mode: data.paymentMode,
+      employee_id: data.employeeId,
+      notes: data.notes ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
 
-      const invoice = await tx.salesInvoice.findUnique({
-        where: { id: data.invoiceId },
-        select: { totalAmount: true }
-      });
+    db.prepare(
+      `
+        INSERT INTO payments (
+          payment_id,
+          invoice_id,
+          amount,
+          payment_mode,
+          employee_id,
+          notes,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.payment_id,
+      row.invoice_id,
+      row.amount,
+      row.payment_mode,
+      row.employee_id,
+      row.notes,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
 
-      if (invoice) {
-        const totals = await tx.payment.aggregate({
-          where: { invoiceId: data.invoiceId },
-          _sum: { amount: true }
-        });
+    enqueueOutbox("payments", row.payment_id, "insert", row.version, row);
 
-        const totalPaid = totals._sum.amount ?? 0;
-        const outstandingBalance = invoice.totalAmount - totalPaid;
-        const paymentStatus =
-          outstandingBalance > 0 ? (totalPaid > 0 ? "partial" : "unpaid") : "paid";
+    const payments = db
+      .prepare("SELECT amount FROM payments WHERE invoice_id = ? AND deleted_at IS NULL")
+      .all(data.invoiceId);
+    const totalPaid = payments.reduce((sum: number, p: any) => sum + Number(p.amount), 0);
+    const outstandingBalance = Number(invoice.total_amount) - totalPaid;
+    let paymentStatus = "paid";
+    if (outstandingBalance > 0) {
+      paymentStatus = totalPaid > 0 ? "partial" : "unpaid";
+    }
 
-        await tx.salesInvoice.update({
-          where: { id: data.invoiceId },
-          data: {
-            outstandingBalance,
-            paymentStatus
-          }
-        });
-      }
+    const invoiceUpdatedAt = nowIso();
+    const invoiceVersion = Number(invoice.version ?? 1) + 1;
+    const invoiceRow = {
+      ...invoice,
+      outstanding_balance: outstandingBalance,
+      payment_status: paymentStatus,
+      version: invoiceVersion,
+      updated_at: invoiceUpdatedAt,
+      last_modified_by_device_id: deviceId
+    };
 
-      return payment;
-    });
+    db.prepare(
+      `
+        UPDATE sales_invoices
+        SET outstanding_balance = ?, payment_status = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE invoice_id = ?
+      `
+    ).run(
+      invoiceRow.outstanding_balance,
+      invoiceRow.payment_status,
+      invoiceRow.version,
+      invoiceRow.updated_at,
+      invoiceRow.last_modified_by_device_id,
+      invoiceRow.invoice_id
+    );
+
+    enqueueOutbox("sales_invoices", invoiceRow.invoice_id, "update", invoiceRow.version, invoiceRow);
+
+    return row;
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.payment.findUnique({
-      where: { id },
-      include: {
-        invoice: {
-          include: {
-            customer: true,
-            employee: true
-          }
-        }
-      }
-    });
+    const db = getLocalDb();
+    return db
+      .prepare("SELECT * FROM payments WHERE payment_id = ? AND deleted_at IS NULL")
+      .get(id);
   },
 
   update: async (
     id: string,
     data: {
       amount?: number;
-      paymentMethod?: string;
+      paymentMode?: string;
       notes?: string;
     }
   ) => {
-    const prisma = getPrismaClient();
-    return await prisma.payment.update({
-      where: { id },
-      data,
-      include: {
-        invoice: {
-          include: {
-            customer: true
-          }
-        }
-      }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM payments WHERE payment_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Payment not found");
+    }
+
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      amount: data.amount ?? existing.amount,
+      payment_mode: data.paymentMode ?? existing.payment_mode,
+      notes: data.notes ?? existing.notes,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE payments
+        SET amount = ?, payment_mode = ?, notes = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE payment_id = ?
+      `
+    ).run(
+      row.amount,
+      row.payment_mode,
+      row.notes,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("payments", id, "update", row.version, row);
+    return row;
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.payment.delete({
-      where: { id }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM payments WHERE payment_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Payment not found");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE payments
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE payment_id = ?
+      `
+    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
+
+    enqueueOutbox("payments", id, "delete", row.version, row);
+    return row;
   }
-};
-
-type SettingsRow = {
-  key: string;
-  value: string;
-  type: string;
-  category: string;
-  description?: string | null;
-  createdAt: Date;
-  updatedAt: Date;
-};
-
-const settingsCache = new Map<string, SettingsRow[]>();
-const settingsCacheInFlight = new Map<string, Promise<SettingsRow[]>>();
-
-const resolveSettingsCacheKey = (): string => getActiveSchema() ?? "__public__";
-
-const clearSettingsCache = (schemaName?: string): void => {
-  const cacheKey = schemaName ?? resolveSettingsCacheKey();
-  settingsCache.delete(cacheKey);
-  settingsCacheInFlight.delete(cacheKey);
-};
-
-const getSettingsCached = async (): Promise<SettingsRow[]> => {
-  const cacheKey = resolveSettingsCacheKey();
-  const cached = settingsCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  const inFlight = settingsCacheInFlight.get(cacheKey);
-  if (inFlight) {
-    return inFlight;
-  }
-
-  const prisma = getPrismaClient();
-  const promise = prisma.settings
-    .findMany({
-      orderBy: { key: "asc" }
-    })
-    .then((rows) => {
-      settingsCache.set(cacheKey, rows as SettingsRow[]);
-      settingsCacheInFlight.delete(cacheKey);
-      return rows as SettingsRow[];
-    })
-    .catch((error) => {
-      settingsCacheInFlight.delete(cacheKey);
-      throw error;
-    });
-
-  settingsCacheInFlight.set(cacheKey, promise);
-  return promise;
 };
 
 export const settingsService = {
@@ -3068,10 +5445,22 @@ export const settingsService = {
   },
 
   findByKey: async (key: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.settings.findUnique({
-      where: { key }
-    });
+    const db = getLocalDb();
+    const row = db
+      .prepare("SELECT * FROM settings WHERE key = ? AND deleted_at IS NULL")
+      .get(key);
+    if (!row) {
+      return null;
+    }
+    return {
+      key: row.key,
+      value: row.value,
+      type: row.type,
+      category: row.category,
+      description: row.description,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
   },
 
   upsert: async (
@@ -3081,41 +5470,113 @@ export const settingsService = {
     category: string = "general",
     description?: string
   ) => {
-    const prisma = getPrismaClient();
-
-    // First try to find existing setting
-    const existing = await prisma.settings.findUnique({
-      where: { key }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM settings WHERE key = ? AND deleted_at IS NULL")
+      .get(key);
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
 
     if (existing) {
-      // Update existing
-      const updated = await prisma.settings.update({
-        where: { key },
-        data: {
-          value,
-          type,
-          category,
-          description,
-          updatedAt: new Date()
-        }
-      });
+      const version = Number(existing.version ?? 1) + 1;
+      const row = {
+        ...existing,
+        value,
+        type,
+        category,
+        description: description ?? existing.description,
+        version,
+        updated_at: timestamp,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE settings
+          SET value = ?, type = ?, category = ?, description = ?,
+              version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE key = ?
+        `
+      ).run(
+        row.value,
+        row.type,
+        row.category,
+        row.description,
+        row.version,
+        row.updated_at,
+        row.last_modified_by_device_id,
+        key
+      );
+
+      enqueueOutbox("settings", row.setting_id, "update", row.version, row);
       clearSettingsCache();
-      return updated;
-    } else {
-      // Create new
-      const created = await prisma.settings.create({
-        data: {
+      return {
+        key: row.key,
+        value: row.value,
+        type: row.type,
+        category: row.category,
+        description: row.description,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      };
+    }
+
+    const settingId = randomUUID();
+    const row = {
+      setting_id: settingId,
+      key,
+      value,
+      type,
+      category,
+      description: description ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO settings (
+          setting_id,
           key,
           value,
           type,
           category,
-          description
-        }
-      });
-      clearSettingsCache();
-      return created;
-    }
+          description,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.setting_id,
+      row.key,
+      row.value,
+      row.type,
+      row.category,
+      row.description,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox("settings", row.setting_id, "insert", row.version, row);
+    clearSettingsCache();
+    return {
+      key: row.key,
+      value: row.value,
+      type: row.type,
+      category: row.category,
+      description: row.description,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
   },
 
   updateBulk: async (
@@ -3127,56 +5588,145 @@ export const settingsService = {
       description?: string;
     }>
   ) => {
-    const prisma = getPrismaClient();
-    const result = await prisma.$transaction(async (tx) => {
-      const updatedSettings: SettingsRow[] = [];
-      for (const setting of settings) {
-        const updateResult = await tx.settings.updateMany({
-          where: { key: setting.key },
-          data: {
-            value: setting.value,
-            type: setting.type ?? "string",
-            category: setting.category ?? "general",
-            description: setting.description,
-            updatedAt: new Date()
-          }
-        });
+    const db = getLocalDb();
+    const updatedSettings: SettingsRow[] = [];
 
-        if (updateResult.count === 0) {
-          const created = await tx.settings.create({
-            data: {
-              key: setting.key,
-              value: setting.value,
-              type: setting.type ?? "string",
-              category: setting.category ?? "general",
-              description: setting.description
-            }
-          });
-          updatedSettings.push(created);
-          continue;
-        }
-
-        const updated = await tx.settings.findFirst({
-          where: { key: setting.key },
-          orderBy: { updatedAt: "desc" }
+    for (const setting of settings) {
+      const existing = db
+        .prepare("SELECT * FROM settings WHERE key = ? AND deleted_at IS NULL")
+        .get(setting.key);
+      const deviceId = ensureDeviceId();
+      const timestamp = nowIso();
+      if (existing) {
+        const version = Number(existing.version ?? 1) + 1;
+        const row = {
+          ...existing,
+          value: setting.value,
+          type: setting.type ?? existing.type ?? "string",
+          category: setting.category ?? existing.category ?? "general",
+          description: setting.description ?? existing.description,
+          version,
+          updated_at: timestamp,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            UPDATE settings
+            SET value = ?, type = ?, category = ?, description = ?,
+                version = ?, updated_at = ?, last_modified_by_device_id = ?
+            WHERE key = ?
+          `
+        ).run(
+          row.value,
+          row.type,
+          row.category,
+          row.description,
+          row.version,
+          row.updated_at,
+          row.last_modified_by_device_id,
+          row.key
+        );
+        enqueueOutbox("settings", row.setting_id, "update", row.version, row);
+        updatedSettings.push({
+          key: row.key,
+          value: row.value,
+          type: row.type,
+          category: row.category,
+          description: row.description,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
         });
-        if (updated) {
-          updatedSettings.push(updated);
-        }
+      } else {
+        const row = {
+          setting_id: randomUUID(),
+          key: setting.key,
+          value: setting.value,
+          type: setting.type ?? "string",
+          category: setting.category ?? "general",
+          description: setting.description ?? null,
+          version: 1,
+          created_at: timestamp,
+          updated_at: timestamp,
+          deleted_at: null,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            INSERT INTO settings (
+              setting_id,
+              key,
+              value,
+              type,
+              category,
+              description,
+              version,
+              created_at,
+              updated_at,
+              deleted_at,
+              last_modified_by_device_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        ).run(
+          row.setting_id,
+          row.key,
+          row.value,
+          row.type,
+          row.category,
+          row.description,
+          row.version,
+          row.created_at,
+          row.updated_at,
+          row.deleted_at,
+          row.last_modified_by_device_id
+        );
+        enqueueOutbox("settings", row.setting_id, "insert", row.version, row);
+        updatedSettings.push({
+          key: row.key,
+          value: row.value,
+          type: row.type,
+          category: row.category,
+          description: row.description,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
+        });
       }
-      return updatedSettings;
-    });
+    }
+
     clearSettingsCache();
-    return result;
+    return updatedSettings;
   },
 
   delete: async (key: string) => {
-    const prisma = getPrismaClient();
-    const deleted = await prisma.settings.delete({
-      where: { key }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM settings WHERE key = ? AND deleted_at IS NULL")
+      .get(key);
+    if (!existing) {
+      return null;
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    db.prepare(
+      `
+        UPDATE settings
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE key = ?
+      `
+    ).run(deletedAt, version, deletedAt, deviceId, key);
+
+    const payload = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+    enqueueOutbox("settings", payload.setting_id, "delete", payload.version, payload);
     clearSettingsCache();
-    return deleted;
+    return payload;
   },
 
   getByCategory: async (category: string) => {
@@ -3190,50 +5740,134 @@ export const settingsService = {
 // Role and Permission Services
 export const roleService = {
   findMany: async () => {
-    const prisma = getPrismaClient();
-    return await prisma.role.findMany({
-      include: {
-        rolePermissions: {
-          include: {
-            permission: true
-          }
+    const db = getLocalDb();
+    const roles = db
+      .prepare("SELECT * FROM roles WHERE deleted_at IS NULL ORDER BY name ASC")
+      .all() as any[];
+
+    const roleIds = roles.map((role) => role.role_id);
+    const rolePermissions = roleIds.length
+      ? db
+          .prepare(
+            `
+              SELECT rp.role_id, rp.permission_id, rp.granted, p.module, p.action, p.scope, p.description
+              FROM role_permissions rp
+              JOIN permissions p ON p.permission_id = rp.permission_id
+              WHERE rp.deleted_at IS NULL AND p.deleted_at IS NULL AND rp.role_id IN (${roleIds
+                .map(() => "?")
+                .join(", ")})
+            `
+          )
+          .all(...roleIds)
+      : [];
+
+    const employeeRoles = roleIds.length
+      ? db
+          .prepare(
+            `
+              SELECT er.role_id, er.employee_id, e.name, e.email
+              FROM employee_roles er
+              JOIN employee e ON e.id = er.employee_id
+              WHERE er.deleted_at IS NULL AND e.deleted_at IS NULL AND er.role_id IN (${roleIds
+                .map(() => "?")
+                .join(", ")})
+            `
+          )
+          .all(...roleIds)
+      : [];
+
+    const permissionMap = new Map();
+    for (const row of rolePermissions) {
+      const list = permissionMap.get(row.role_id) ?? [];
+      list.push({
+        permission: {
+          id: row.permission_id,
+          module: row.module,
+          action: row.action,
+          scope: row.scope,
+          description: row.description
         },
-        employeeRoles: {
-          include: {
-            employee: true
-          }
+        granted: Boolean(row.granted)
+      });
+      permissionMap.set(row.role_id, list);
+    }
+
+    const employeeMap = new Map();
+    for (const row of employeeRoles) {
+      const list = employeeMap.get(row.role_id) ?? [];
+      list.push({
+        employee: {
+          id: row.employee_id,
+          name: row.name,
+          email: row.email
         }
-      },
-      orderBy: { name: "asc" }
-    });
+      });
+      employeeMap.set(row.role_id, list);
+    }
+
+    return roles.map((role) => ({
+      ...role,
+      rolePermissions: permissionMap.get(role.role_id) ?? [],
+      employeeRoles: employeeMap.get(role.role_id) ?? []
+    }));
   },
 
   create: async (data: { name: string; description?: string; isSystem?: boolean }) => {
-    const prisma = getPrismaClient();
-
-    // Check for duplicate name
-    const existing = await prisma.role.findUnique({
-      where: { name: data.name }
-    });
-
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT role_id FROM roles WHERE name = ? AND deleted_at IS NULL")
+      .get(data.name);
     if (existing) {
       throw new Error(`Role with name "${data.name}" already exists`);
     }
 
-    return await prisma.role.create({
-      data: {
-        name: data.name,
-        description: data.description,
-        isSystem: data.isSystem || false
-      },
-      include: {
-        rolePermissions: {
-          include: {
-            permission: true
-          }
-        }
-      }
-    });
+    const roleId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      role_id: roleId,
+      name: data.name,
+      description: data.description ?? null,
+      is_system: data.isSystem ? 1 : 0,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO roles (
+          role_id,
+          name,
+          description,
+          is_system,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.role_id,
+      row.name,
+      row.description,
+      row.is_system,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox("roles", row.role_id, "insert", row.version, row);
+    return {
+      ...row,
+      rolePermissions: []
+    };
   },
 
   update: async (
@@ -3243,165 +5877,336 @@ export const roleService = {
       description?: string;
     }
   ) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM roles WHERE role_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Role not found");
+    }
 
-    // Check if it's a system role
-    const role = await prisma.role.findUnique({
-      where: { id }
-    });
-
-    if (role?.isSystem) {
+    if (existing.is_system) {
       throw new Error("Cannot modify system roles");
     }
 
-    // Check for duplicate name if name is being updated
     if (data.name) {
-      const existing = await prisma.role.findFirst({
-        where: {
-          name: data.name,
-          NOT: { id }
-        }
-      });
-
-      if (existing) {
+      const duplicate = db
+        .prepare("SELECT role_id FROM roles WHERE name = ? AND role_id != ? AND deleted_at IS NULL")
+        .get(data.name, id);
+      if (duplicate) {
         throw new Error(`Role with name "${data.name}" already exists`);
       }
     }
 
-    return await prisma.role.update({
-      where: { id },
-      data,
-      include: {
-        rolePermissions: {
-          include: {
-            permission: true
-          }
-        }
-      }
-    });
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      name: data.name ?? existing.name,
+      description: data.description ?? existing.description,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE roles
+        SET name = ?, description = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE role_id = ?
+      `
+    ).run(
+      row.name,
+      row.description,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      id
+    );
+
+    enqueueOutbox("roles", id, "update", row.version, row);
+    return {
+      ...row,
+      rolePermissions: []
+    };
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
-
-    try {
-      const result = await prisma.$transaction(async (tx) => {
-        // Check if it's a system role
-        const role = await tx.role.findUnique({
-          where: { id }
-        });
-
-        if (role?.isSystem) {
-          throw new Error("Cannot delete system roles");
-        }
-
-        // Check if role is assigned to any employees
-        const assignedEmployees = await tx.employeeRole.findMany({
-          where: { roleId: id }
-        });
-
-        if (assignedEmployees.length > 0) {
-          throw new Error(
-            `Cannot delete role that is assigned to ${assignedEmployees.length} employee(s). Remove role assignments first.`
-          );
-        }
-
-        // Delete role permissions first
-        await tx.rolePermission.deleteMany({
-          where: { roleId: id }
-        });
-
-        // Delete the role
-        return await tx.role.delete({
-          where: { id }
-        });
-      });
-
-      return { success: true, data: result };
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : "Unknown error" };
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM roles WHERE role_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Role not found");
     }
+
+    if (existing.is_system) {
+      throw new Error("Cannot delete system roles");
+    }
+
+    const assignedEmployees = db
+      .prepare("SELECT employee_id FROM employee_roles WHERE role_id = ? AND deleted_at IS NULL")
+      .all(id);
+
+    if (assignedEmployees.length > 0) {
+      throw new Error("Cannot delete role assigned to employees");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE roles
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE role_id = ?
+      `
+    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
+
+    enqueueOutbox("roles", id, "delete", row.version, row);
+
+    const rolePermissions = db
+      .prepare("SELECT * FROM role_permissions WHERE role_id = ? AND deleted_at IS NULL")
+      .all(id);
+    for (const rp of rolePermissions) {
+      const rpDeletedAt = nowIso();
+      const rpVersion = Number(rp.version ?? 1) + 1;
+      const rpRow = {
+        ...rp,
+        deleted_at: rpDeletedAt,
+        version: rpVersion,
+        updated_at: rpDeletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE role_permissions
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE role_id = ? AND permission_id = ?
+        `
+      ).run(
+        rpRow.deleted_at,
+        rpRow.version,
+        rpRow.updated_at,
+        rpRow.last_modified_by_device_id,
+        rpRow.role_id,
+        rpRow.permission_id
+      );
+      enqueueOutbox(
+        "role_permissions",
+        buildCompositeRowId({ role_id: rpRow.role_id, permission_id: rpRow.permission_id }),
+        "delete",
+        rpRow.version,
+        rpRow
+      );
+    }
+
+    return row;
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.role.findUnique({
-      where: { id },
-      include: {
-        rolePermissions: {
-          include: {
-            permission: true
-          }
+    const db = getLocalDb();
+    const role = db
+      .prepare("SELECT * FROM roles WHERE role_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!role) {
+      return null;
+    }
+
+    const rolePermissions = db
+      .prepare(
+        `
+          SELECT rp.permission_id, rp.granted, p.module, p.action, p.scope, p.description
+          FROM role_permissions rp
+          JOIN permissions p ON p.permission_id = rp.permission_id
+          WHERE rp.deleted_at IS NULL AND p.deleted_at IS NULL AND rp.role_id = ?
+        `
+      )
+      .all(id);
+
+    const employeeRoles = db
+      .prepare(
+        `
+          SELECT er.employee_id, e.name, e.email
+          FROM employee_roles er
+          JOIN employee e ON e.id = er.employee_id
+          WHERE er.deleted_at IS NULL AND e.deleted_at IS NULL AND er.role_id = ?
+        `
+      )
+      .all(id);
+
+    return {
+      ...role,
+      rolePermissions: rolePermissions.map((row: any) => ({
+        permission: {
+          id: row.permission_id,
+          module: row.module,
+          action: row.action,
+          scope: row.scope,
+          description: row.description
         },
-        employeeRoles: {
-          include: {
-            employee: true
-          }
+        granted: Boolean(row.granted)
+      })),
+      employeeRoles: employeeRoles.map((row: any) => ({
+        employee: {
+          id: row.employee_id,
+          name: row.name,
+          email: row.email
         }
-      }
-    });
+      }))
+    };
   },
 
   assignToEmployee: async (roleId: string, employeeId: string, assignedBy?: string) => {
-    const prisma = getPrismaClient();
-
-    // Check if assignment already exists
-    const existing = await prisma.employeeRole.findUnique({
-      where: {
-        employeeId_roleId: {
-          employeeId,
-          roleId
-        }
-      }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare(
+        "SELECT * FROM employee_roles WHERE employee_id = ? AND role_id = ? AND deleted_at IS NULL"
+      )
+      .get(employeeId, roleId);
 
     if (existing) {
       throw new Error("Employee already has this role assigned");
     }
 
-    return await prisma.employeeRole.create({
-      data: {
-        roleId,
-        employeeId,
-        assignedBy
-      },
-      include: {
-        role: true,
-        employee: true
-      }
-    });
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      employee_id: employeeId,
+      role_id: roleId,
+      assigned_at: timestamp,
+      assigned_by: assignedBy ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO employee_roles (
+          employee_id,
+          role_id,
+          assigned_at,
+          assigned_by,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.employee_id,
+      row.role_id,
+      row.assigned_at,
+      row.assigned_by,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox(
+      "employee_roles",
+      buildCompositeRowId({ employee_id: row.employee_id, role_id: row.role_id }),
+      "insert",
+      row.version,
+      row
+    );
+
+    const role = db
+      .prepare("SELECT role_id, name, description, is_system FROM roles WHERE role_id = ?")
+      .get(roleId);
+    const employee = db
+      .prepare("SELECT id, name, email FROM employee WHERE id = ?")
+      .get(employeeId);
+
+    return {
+      role: role
+        ? { id: role.role_id, name: role.name, description: role.description, isSystem: Boolean(role.is_system) }
+        : null,
+      employee: employee ? { id: employee.id, name: employee.name, email: employee.email } : null
+    };
   },
 
   removeFromEmployee: async (roleId: string, employeeId: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare(
+        "SELECT * FROM employee_roles WHERE employee_id = ? AND role_id = ? AND deleted_at IS NULL"
+      )
+      .get(employeeId, roleId);
 
-    return await prisma.employeeRole.delete({
-      where: {
-        employeeId_roleId: {
-          employeeId,
-          roleId
-        }
-      }
-    });
+    if (!existing) {
+      throw new Error("Employee role assignment not found");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE employee_roles
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE employee_id = ? AND role_id = ?
+      `
+    ).run(
+      row.deleted_at,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      employeeId,
+      roleId
+    );
+
+    enqueueOutbox(
+      "employee_roles",
+      buildCompositeRowId({ employee_id: employeeId, role_id: roleId }),
+      "delete",
+      row.version,
+      row
+    );
+
+    return row;
   },
 
   checkUsage: async (roleId: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const countRow = db
+      .prepare("SELECT COUNT(1) AS count FROM employee_roles WHERE role_id = ? AND deleted_at IS NULL")
+      .get(roleId);
 
-    const count = await prisma.employeeRole.count({
-      where: { roleId }
-    });
-
-    return { count };
+    return { count: Number(countRow?.count ?? 0) };
   }
 };
 
 export const permissionService = {
   findMany: async () => {
-    const prisma = getPrismaClient();
-    return await prisma.permission.findMany({
-      orderBy: [{ module: "asc" }, { action: "asc" }, { scope: "asc" }]
-    });
+    const db = getLocalDb();
+    return db
+      .prepare("SELECT * FROM permissions WHERE deleted_at IS NULL ORDER BY module, action, scope")
+      .all();
   },
 
   create: async (data: {
@@ -3410,11 +6215,63 @@ export const permissionService = {
     scope?: string;
     description?: string;
   }) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare(
+        "SELECT permission_id FROM permissions WHERE module = ? AND action = ? AND scope IS ? AND deleted_at IS NULL"
+      )
+      .get(data.module, data.action, data.scope ?? null);
+    if (existing) {
+      throw new Error("Permission already exists");
+    }
 
-    return await prisma.permission.create({
-      data
-    });
+    const permissionId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      permission_id: permissionId,
+      module: data.module,
+      action: data.action,
+      scope: data.scope ?? null,
+      description: data.description ?? null,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO permissions (
+          permission_id,
+          module,
+          action,
+          scope,
+          description,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.permission_id,
+      row.module,
+      row.action,
+      row.scope,
+      row.description,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox("permissions", row.permission_id, "insert", row.version, row);
+    return row;
   },
 
   update: async (
@@ -3423,50 +6280,83 @@ export const permissionService = {
       description?: string;
     }
   ) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM permissions WHERE permission_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Permission not found");
+    }
 
-    return await prisma.permission.update({
-      where: { id },
-      data
-    });
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      description: data.description ?? existing.description,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE permissions
+        SET description = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE permission_id = ?
+      `
+    ).run(row.description, row.version, row.updated_at, row.last_modified_by_device_id, id);
+
+    enqueueOutbox("permissions", id, "update", row.version, row);
+    return row;
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM permissions WHERE permission_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Permission not found");
+    }
 
-    return await prisma.$transaction(async (tx) => {
-      // Check if permission is assigned to any roles
-      const assignedRoles = await tx.rolePermission.findMany({
-        where: { permissionId: id }
-      });
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
 
-      if (assignedRoles.length > 0) {
-        // Remove permission from all roles first
-        await tx.rolePermission.deleteMany({
-          where: { permissionId: id }
-        });
-      }
+    db.prepare(
+      `
+        UPDATE permissions
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE permission_id = ?
+      `
+    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
 
-      // Delete the permission
-      return await tx.permission.delete({
-        where: { id }
-      });
-    });
+    enqueueOutbox("permissions", id, "delete", row.version, row);
+    return row;
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.permission.findUnique({
-      where: { id }
-    });
+    const db = getLocalDb();
+    return db
+      .prepare("SELECT * FROM permissions WHERE permission_id = ? AND deleted_at IS NULL")
+      .get(id);
   },
 
   findByModule: async (module: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.permission.findMany({
-      where: { module },
-      orderBy: [{ action: "asc" }, { scope: "asc" }]
-    });
+    const db = getLocalDb();
+    return db
+      .prepare(
+        "SELECT * FROM permissions WHERE module = ? AND deleted_at IS NULL ORDER BY action ASC, scope ASC"
+      )
+      .all(module);
   },
 
   bulkCreate: async (
@@ -3477,45 +6367,84 @@ export const permissionService = {
       description?: string;
     }>
   ) => {
-    const prisma = getPrismaClient();
-
+    const db = getLocalDb();
     const results: any[] = [];
 
     for (const perm of permissions) {
-      try {
-        // First try to find existing permission
-        const existing = await prisma.permission.findFirst({
-          where: {
-            module: perm.module,
-            action: perm.action,
-            scope: perm.scope || null
-          }
-        });
+      const existing = db
+        .prepare(
+          "SELECT * FROM permissions WHERE module = ? AND action = ? AND scope IS ? AND deleted_at IS NULL"
+        )
+        .get(perm.module, perm.action, perm.scope ?? null);
 
-        if (existing) {
-          // Update existing permission
-          const updated = await prisma.permission.update({
-            where: { id: existing.id },
-            data: { description: perm.description }
-          });
-          results.push(updated);
-        } else {
-          const created = await prisma.permission.create({
-            data: {
-              module: perm.module,
-              action: perm.action,
-              scope: perm.scope || null,
-              description: perm.description
-            }
-          });
-          results.push(created);
-        }
-      } catch (error) {
-        console.error(
-          `Error creating/updating permission ${perm.module}:${perm.action}:${perm.scope}:`,
-          error
+      if (existing) {
+        const deviceId = ensureDeviceId();
+        const updatedAt = nowIso();
+        const version = Number(existing.version ?? 1) + 1;
+        const row = {
+          ...existing,
+          description: perm.description ?? existing.description,
+          version,
+          updated_at: updatedAt,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            UPDATE permissions
+            SET description = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+            WHERE permission_id = ?
+          `
+        ).run(row.description, row.version, row.updated_at, row.last_modified_by_device_id, row.permission_id);
+
+        enqueueOutbox("permissions", row.permission_id, "update", row.version, row);
+        results.push(row);
+      } else {
+        const permissionId = randomUUID();
+        const deviceId = ensureDeviceId();
+        const timestamp = nowIso();
+        const row = {
+          permission_id: permissionId,
+          module: perm.module,
+          action: perm.action,
+          scope: perm.scope ?? null,
+          description: perm.description ?? null,
+          version: 1,
+          created_at: timestamp,
+          updated_at: timestamp,
+          deleted_at: null,
+          last_modified_by_device_id: deviceId
+        };
+        db.prepare(
+          `
+            INSERT INTO permissions (
+              permission_id,
+              module,
+              action,
+              scope,
+              description,
+              version,
+              created_at,
+              updated_at,
+              deleted_at,
+              last_modified_by_device_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        ).run(
+          row.permission_id,
+          row.module,
+          row.action,
+          row.scope,
+          row.description,
+          row.version,
+          row.created_at,
+          row.updated_at,
+          row.deleted_at,
+          row.last_modified_by_device_id
         );
-        throw error;
+
+        enqueueOutbox("permissions", row.permission_id, "insert", row.version, row);
+        results.push(row);
       }
     }
 
@@ -3525,110 +6454,214 @@ export const permissionService = {
 
 export const rolePermissionService = {
   grantPermission: async (roleId: string, permissionId: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare(
+        "SELECT * FROM role_permissions WHERE role_id = ? AND permission_id = ? AND deleted_at IS NULL"
+      )
+      .get(roleId, permissionId);
 
-    return await prisma.rolePermission.upsert({
-      where: {
-        roleId_permissionId: {
-          roleId,
-          permissionId
-        }
-      },
-      update: {
-        granted: true
-      },
-      create: {
-        roleId,
-        permissionId,
-        granted: true
-      },
-      include: {
-        role: true,
-        permission: true
-      }
-    });
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+
+    if (existing) {
+      const version = Number(existing.version ?? 1) + 1;
+      const row = {
+        ...existing,
+        granted: 1,
+        version,
+        updated_at: timestamp,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE role_permissions
+          SET granted = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE role_id = ? AND permission_id = ?
+        `
+      ).run(row.granted, row.version, row.updated_at, row.last_modified_by_device_id, roleId, permissionId);
+
+      enqueueOutbox(
+        "role_permissions",
+        buildCompositeRowId({ role_id: roleId, permission_id: permissionId }),
+        "update",
+        row.version,
+        row
+      );
+      return row;
+    }
+
+    const row = {
+      role_id: roleId,
+      permission_id: permissionId,
+      granted: 1,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO role_permissions (
+          role_id,
+          permission_id,
+          granted,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.role_id,
+      row.permission_id,
+      row.granted,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox(
+      "role_permissions",
+      buildCompositeRowId({ role_id: roleId, permission_id: permissionId }),
+      "insert",
+      row.version,
+      row
+    );
+
+    return row;
   },
 
   revokePermission: async (roleId: string, permissionId: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare(
+        "SELECT * FROM role_permissions WHERE role_id = ? AND permission_id = ? AND deleted_at IS NULL"
+      )
+      .get(roleId, permissionId);
 
-    return await prisma.rolePermission.upsert({
-      where: {
-        roleId_permissionId: {
-          roleId,
-          permissionId
-        }
-      },
-      update: {
-        granted: false
-      },
-      create: {
-        roleId,
-        permissionId,
-        granted: false
-      },
-      include: {
-        role: true,
-        permission: true
-      }
-    });
+    if (!existing) {
+      throw new Error("Role permission not found");
+    }
+
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      granted: 0,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE role_permissions
+        SET granted = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE role_id = ? AND permission_id = ?
+      `
+    ).run(row.granted, row.version, row.updated_at, row.last_modified_by_device_id, roleId, permissionId);
+
+    enqueueOutbox(
+      "role_permissions",
+      buildCompositeRowId({ role_id: roleId, permission_id: permissionId }),
+      "update",
+      row.version,
+      row
+    );
+
+    return row;
   },
 
   removePermission: async (roleId: string, permissionId: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const existing = db
+      .prepare(
+        "SELECT * FROM role_permissions WHERE role_id = ? AND permission_id = ? AND deleted_at IS NULL"
+      )
+      .get(roleId, permissionId);
 
-    return await prisma.rolePermission.delete({
-      where: {
-        roleId_permissionId: {
-          roleId,
-          permissionId
-        }
-      }
-    });
+    if (!existing) {
+      throw new Error("Role permission not found");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE role_permissions
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE role_id = ? AND permission_id = ?
+      `
+    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, roleId, permissionId);
+
+    enqueueOutbox(
+      "role_permissions",
+      buildCompositeRowId({ role_id: roleId, permission_id: permissionId }),
+      "delete",
+      row.version,
+      row
+    );
+
+    return row;
   },
 
   getRolePermissions: async (roleId: string) => {
-    const prisma = getPrismaClient();
-
-    return await prisma.rolePermission.findMany({
-      where: { roleId },
-      include: {
-        permission: true
-      }
-    });
+    const db = getLocalDb();
+    return db
+      .prepare(
+        `
+          SELECT rp.role_id, rp.permission_id, rp.granted, p.module, p.action, p.scope, p.description
+          FROM role_permissions rp
+          JOIN permissions p ON p.permission_id = rp.permission_id
+          WHERE rp.deleted_at IS NULL AND p.deleted_at IS NULL AND rp.role_id = ?
+        `
+      )
+      .all(roleId);
   },
 
   getEmployeePermissions: async (employeeId: string) => {
-    const prisma = getPrismaClient();
+    const db = getLocalDb();
+    const rows = db
+      .prepare(
+        `
+          SELECT p.permission_id, p.module, p.action, p.scope, p.description
+          FROM employee_roles er
+          JOIN role_permissions rp ON rp.role_id = er.role_id
+          JOIN permissions p ON p.permission_id = rp.permission_id
+          WHERE er.deleted_at IS NULL
+            AND rp.deleted_at IS NULL
+            AND p.deleted_at IS NULL
+            AND er.employee_id = ?
+            AND rp.granted = 1
+        `
+      )
+      .all(employeeId);
 
-    // Get all roles assigned to the employee
-    const employeeRoles = await prisma.employeeRole.findMany({
-      where: { employeeId },
-      include: {
-        role: {
-          include: {
-            rolePermissions: {
-              where: { granted: true },
-              include: {
-                permission: true
-              }
-            }
-          }
-        }
+    const seen = new Set();
+    return rows.filter((row: any) => {
+      if (seen.has(row.permission_id)) {
+        return false;
       }
+      seen.add(row.permission_id);
+      return true;
     });
-
-    // Flatten permissions from all roles
-    const permissions = employeeRoles.flatMap((er) =>
-      er.role.rolePermissions.map((rp) => rp.permission)
-    );
-
-    // Remove duplicates
-    const uniquePermissions = permissions.filter(
-      (perm, index, self) => index === self.findIndex((p) => p.id === perm.id)
-    );
-
-    return uniquePermissions;
   },
 
   checkEmployeePermission: async (
@@ -3640,7 +6673,7 @@ export const rolePermissionService = {
     const permissions = await rolePermissionService.getEmployeePermissions(employeeId);
 
     return permissions.some(
-      (perm) =>
+      (perm: any) =>
         perm.module === module &&
         perm.action === action &&
         (scope === undefined || perm.scope === scope || perm.scope === null)
@@ -3650,69 +6683,247 @@ export const rolePermissionService = {
 
 export const customProductService = {
   findMany: async (options?: FindManyOptions) => {
-    const prisma = getPrismaClient();
-    const query: Record<string, unknown> = {
-      orderBy: { createdAt: "desc" }
-    };
+    const db = getLocalDb();
+    const selectKeys =
+      options?.select && Object.keys(options.select).filter((key) => options.select?.[key]);
+    const columns = selectKeys && selectKeys.length > 0 ? selectKeys.join(", ") : "*";
 
-    if (options?.select) {
-      query.select = options.select;
+    let sql = `SELECT ${columns} FROM custom_products WHERE deleted_at IS NULL ORDER BY created_at DESC`;
+    const params: Array<string | number> = [];
+    if (options?.pagination?.take) {
+      sql += " LIMIT ?";
+      params.push(options.pagination.take);
+    }
+    if (options?.pagination?.skip) {
+      sql += " OFFSET ?";
+      params.push(options.pagination.skip);
     }
 
-    applyPagination(query, options?.pagination);
-    return await prisma.customProduct.findMany(query as any);
+    return db.prepare(sql).all(...params);
   },
 
   create: async (data: { name: string; price: number }) => {
-    const prisma = getPrismaClient();
-    return await prisma.customProduct.create({
-      data
-    });
+    const db = getLocalDb();
+    const customProductId = randomUUID();
+    const deviceId = ensureDeviceId();
+    const timestamp = nowIso();
+    const row = {
+      custom_product_id: customProductId,
+      name: data.name,
+      price: data.price,
+      version: 1,
+      created_at: timestamp,
+      updated_at: timestamp,
+      deleted_at: null,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        INSERT INTO custom_products (
+          custom_product_id,
+          name,
+          price,
+          version,
+          created_at,
+          updated_at,
+          deleted_at,
+          last_modified_by_device_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).run(
+      row.custom_product_id,
+      row.name,
+      row.price,
+      row.version,
+      row.created_at,
+      row.updated_at,
+      row.deleted_at,
+      row.last_modified_by_device_id
+    );
+
+    enqueueOutbox("custom_products", row.custom_product_id, "insert", row.version, row);
+    return row;
   },
 
   findById: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.customProduct.findUnique({
-      where: { id }
-    });
+    const db = getLocalDb();
+    return db
+      .prepare("SELECT * FROM custom_products WHERE custom_product_id = ? AND deleted_at IS NULL")
+      .get(id);
   },
 
   update: async (id: string, data: { name?: string; price?: number }) => {
-    const prisma = getPrismaClient();
-    return await prisma.customProduct.update({
-      where: { id },
-      data
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM custom_products WHERE custom_product_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Custom product not found");
+    }
+
+    const deviceId = ensureDeviceId();
+    const updatedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const row = {
+      ...existing,
+      name: data.name ?? existing.name,
+      price: data.price ?? existing.price,
+      version,
+      updated_at: updatedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE custom_products
+        SET name = ?, price = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE custom_product_id = ?
+      `
+    ).run(row.name, row.price, row.version, row.updated_at, row.last_modified_by_device_id, id);
+
+    enqueueOutbox("custom_products", id, "update", row.version, row);
+    return row;
   },
 
   delete: async (id: string) => {
-    const prisma = getPrismaClient();
-    return await prisma.customProduct.delete({
-      where: { id }
-    });
+    const db = getLocalDb();
+    const existing = db
+      .prepare("SELECT * FROM custom_products WHERE custom_product_id = ? AND deleted_at IS NULL")
+      .get(id);
+    if (!existing) {
+      throw new Error("Custom product not found");
+    }
+
+    const deletedAt = nowIso();
+    const version = Number(existing.version ?? 1) + 1;
+    const deviceId = ensureDeviceId();
+    const row = {
+      ...existing,
+      deleted_at: deletedAt,
+      version,
+      updated_at: deletedAt,
+      last_modified_by_device_id: deviceId
+    };
+
+    db.prepare(
+      `
+        UPDATE custom_products
+        SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+        WHERE custom_product_id = ?
+      `
+    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
+
+    enqueueOutbox("custom_products", id, "delete", row.version, row);
+    return row;
   }
 };
 
-// Tenant Services for Multi-Tenancy
+let tenantTablesEnsured = false;
+let tenantTablesEnsuring: Promise<void> | null = null;
+
+const ensureTenantTables = async (): Promise<void> => {
+  if (tenantTablesEnsured) {
+    return;
+  }
+
+  if (tenantTablesEnsuring) {
+    await tenantTablesEnsuring;
+    return;
+  }
+
+  tenantTablesEnsuring = (async () => {
+    const prisma = getPrismaClient();
+    const result = (await prisma.$queryRawUnsafe(
+      "SELECT to_regclass('public.tenants')::text AS tenants, to_regclass('public.tenant_users')::text AS tenant_users, to_regclass('public.subscriptions')::text AS subscriptions"
+    )) as { tenants?: string | null; tenant_users?: string | null; subscriptions?: string | null }[];
+
+    const status = result?.[0] ?? {};
+    const hasTenants = Boolean(status.tenants);
+    const hasTenantUsers = Boolean(status.tenant_users);
+    const hasSubscriptions = Boolean(status.subscriptions);
+
+    if (!hasTenants) {
+      await prisma.$executeRawUnsafe(`
+        CREATE TABLE IF NOT EXISTS public.tenants (
+          id TEXT PRIMARY KEY,
+          "schemaName" TEXT NOT NULL UNIQUE,
+          "businessName" TEXT,
+          "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+      `);
+    }
+
+    if (!hasTenantUsers) {
+      await prisma.$executeRawUnsafe(`
+        CREATE TABLE IF NOT EXISTS public.tenant_users (
+          id TEXT PRIMARY KEY,
+          "tenantId" TEXT NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+          email TEXT NOT NULL UNIQUE,
+          "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+      `);
+    }
+
+    if (!hasSubscriptions) {
+      await prisma.$executeRawUnsafe(`
+        CREATE TABLE IF NOT EXISTS public.subscriptions (
+          id TEXT PRIMARY KEY,
+          "tenantId" TEXT NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+          "planName" TEXT NOT NULL,
+          "joinedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          "expiresAt" TIMESTAMP WITH TIME ZONE NOT NULL,
+          status TEXT NOT NULL,
+          "createdAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          "updatedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+      `);
+    }
+
+    await prisma.$executeRawUnsafe(
+      "CREATE INDEX IF NOT EXISTS idx_tenant_users_email ON public.tenant_users(email);"
+    );
+    await prisma.$executeRawUnsafe(
+      "CREATE INDEX IF NOT EXISTS idx_tenant_users_tenant_id ON public.tenant_users(\"tenantId\");"
+    );
+    await prisma.$executeRawUnsafe(
+      "CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant_id ON public.subscriptions(\"tenantId\");"
+    );
+  })();
+
+  try {
+    await tenantTablesEnsuring;
+    tenantTablesEnsured = true;
+  } finally {
+    tenantTablesEnsuring = null;
+  }
+};
+
 export const tenantService = {
   findMany: async () => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     return await prisma.$queryRaw`
       SELECT * FROM public.tenants
-      ORDER BY created_at DESC
+      ORDER BY "createdAt" DESC
     `;
   },
 
   create: async (data: { id: string; schema_name: string; company_name?: string }) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     return await prisma.$queryRaw`
-      INSERT INTO public.tenants (id, schema_name, company_name, created_at, updated_at)
+      INSERT INTO public.tenants (id, "schemaName", "businessName", "createdAt", "updatedAt")
       VALUES (${data.id}, ${data.schema_name}, ${data.company_name || null}, NOW(), NOW())
       RETURNING *
     `;
   },
 
   findById: async (id: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     const result = await prisma.$queryRaw`
       SELECT * FROM public.tenants WHERE id = ${id}
@@ -3721,34 +6932,36 @@ export const tenantService = {
   },
 
   findBySchemaName: async (schemaName: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     const result = await prisma.$queryRaw`
-      SELECT * FROM public.tenants WHERE schema_name = ${schemaName}
+      SELECT * FROM public.tenants WHERE "schemaName" = ${schemaName}
     `;
     return (result as any[])[0] || null;
   },
 
   update: async (id: string, data: { schema_name?: string; company_name?: string }) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
 
     if (data.schema_name !== undefined && data.company_name !== undefined) {
       return await prisma.$queryRaw`
         UPDATE public.tenants
-        SET schema_name = ${data.schema_name}, company_name = ${data.company_name}, updated_at = NOW()
+        SET "schemaName" = ${data.schema_name}, "businessName" = ${data.company_name}, "updatedAt" = NOW()
         WHERE id = ${id}
         RETURNING *
       `;
     } else if (data.schema_name !== undefined) {
       return await prisma.$queryRaw`
         UPDATE public.tenants
-        SET schema_name = ${data.schema_name}, updated_at = NOW()
+        SET "schemaName" = ${data.schema_name}, "updatedAt" = NOW()
         WHERE id = ${id}
         RETURNING *
       `;
     } else if (data.company_name !== undefined) {
       return await prisma.$queryRaw`
         UPDATE public.tenants
-        SET company_name = ${data.company_name}, updated_at = NOW()
+        SET "businessName" = ${data.company_name}, "updatedAt" = NOW()
         WHERE id = ${id}
         RETURNING *
       `;
@@ -3758,6 +6971,7 @@ export const tenantService = {
   },
 
   delete: async (id: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     return await prisma.$queryRaw`
       DELETE FROM public.tenants WHERE id = ${id}
@@ -3768,10 +6982,11 @@ export const tenantService = {
 
 export const subscriptionService = {
   findMany: async () => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     return await prisma.$queryRaw`
       SELECT * FROM public.subscriptions
-      ORDER BY created_at DESC
+      ORDER BY "createdAt" DESC
     `;
   },
 
@@ -3782,17 +6997,19 @@ export const subscriptionService = {
     expiresAt: Date;
     status: string;
   }) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     const joinedAt = data.joinedAt || new Date();
 
     return await prisma.$queryRaw`
-      INSERT INTO public.subscriptions ("tenantId", "planName", "joinedAt", "expiresAt", status, created_at, updated_at)
+      INSERT INTO public.subscriptions ("tenantId", "planName", "joinedAt", "expiresAt", status, "createdAt", "updatedAt")
       VALUES (${data.tenantId}, ${data.planName}, ${joinedAt}, ${data.expiresAt}, ${data.status}, NOW(), NOW())
       RETURNING *
     `;
   },
 
   findByTenantId: async (tenantId: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     const result = await prisma.$queryRaw`
       SELECT * FROM public.subscriptions
@@ -3804,6 +7021,7 @@ export const subscriptionService = {
   },
 
   findById: async (id: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     const result = await prisma.$queryRaw`
       SELECT * FROM public.subscriptions WHERE id = ${id}
@@ -3819,6 +7037,7 @@ export const subscriptionService = {
       status?: string;
     }
   ) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
 
     const updateFields: string[] = [];
@@ -3841,7 +7060,7 @@ export const subscriptionService = {
 
     if (updateFields.length === 0) return null;
 
-    updateFields.push(`updated_at = NOW()`);
+    updateFields.push(`"updatedAt" = NOW()`);
     values.push(id);
 
     const query = `
@@ -3855,6 +7074,7 @@ export const subscriptionService = {
   },
 
   delete: async (id: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     return await prisma.$queryRaw`
       DELETE FROM public.subscriptions WHERE id = ${id}
@@ -3865,28 +7085,36 @@ export const subscriptionService = {
 
 export const tenantUserService = {
   findMany: async () => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     return await prisma.$queryRaw`
-      SELECT tu.*, t."schemaName", t."businessName"
+      SELECT tu.*, tu."tenantId" AS "tenantId", t."schemaName" AS "schemaName", t."businessName" AS "businessName"
       FROM public.tenant_users tu
       JOIN public.tenants t ON tu."tenantId" = t.id
-      ORDER BY tu.created_at DESC
+      ORDER BY tu."createdAt" DESC
     `;
   },
 
-  create: async (data: { id: string; tenant_id: string; email: string }) => {
+  create: async (data: { id: string; tenant_id?: string; tenantId?: string; email: string }) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
+    const tenantId = data.tenant_id ?? data.tenantId;
+    if (!tenantId) {
+      throw new Error("Missing tenantId for tenant user");
+    }
+
     return await prisma.$queryRaw`
-      INSERT INTO public.tenant_users (id, "tenantId", email, created_at, updated_at)
-      VALUES (${data.id}, ${data.tenant_id}, ${data.email}, NOW(), NOW())
+      INSERT INTO public.tenant_users (id, "tenantId", email, "createdAt", "updatedAt")
+      VALUES (${data.id}, ${tenantId}, ${data.email}, NOW(), NOW())
       RETURNING *
     `;
   },
 
   findByEmail: async (email: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     const result = await prisma.$queryRaw`
-      SELECT tu.*, t."schemaName", t."businessName"
+      SELECT tu.*, tu."tenantId" AS "tenantId", t."schemaName" AS "schemaName", t."businessName" AS "businessName"
       FROM public.tenant_users tu
       JOIN public.tenants t ON tu."tenantId" = t.id
       WHERE tu.email = ${email}
@@ -3895,9 +7123,10 @@ export const tenantUserService = {
   },
 
   findById: async (id: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     const result = await prisma.$queryRaw`
-      SELECT tu.*, t."schemaName", t."businessName"
+      SELECT tu.*, tu."tenantId" AS "tenantId", t."schemaName" AS "schemaName", t."businessName" AS "businessName"
       FROM public.tenant_users tu
       JOIN public.tenants t ON tu."tenantId" = t.id
       WHERE tu.id = ${id}
@@ -3906,18 +7135,20 @@ export const tenantUserService = {
   },
 
   update: async (id: string, data: { email?: string }) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     if (!data.email) return null;
 
     return await prisma.$queryRaw`
       UPDATE public.tenant_users
-      SET email = ${data.email}, updated_at = NOW()
+      SET email = ${data.email}, "updatedAt" = NOW()
       WHERE id = ${id}
       RETURNING *
     `;
   },
 
   delete: async (id: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     return await prisma.$queryRaw`
       DELETE FROM public.tenant_users WHERE id = ${id}
@@ -3926,13 +7157,14 @@ export const tenantUserService = {
   },
 
   findByTenantId: async (tenantId: string) => {
+    await ensureTenantTables();
     const prisma = getPrismaClient();
     return await prisma.$queryRaw`
-      SELECT tu.*, t."schemaName", t."businessName"
+      SELECT tu.*, tu."tenantId" AS "tenantId", t."schemaName" AS "schemaName", t."businessName" AS "businessName"
       FROM public.tenant_users tu
       JOIN public.tenants t ON tu."tenantId" = t.id
       WHERE tu."tenantId" = ${tenantId}
-      ORDER BY tu.created_at DESC
+      ORDER BY tu."createdAt" DESC
     `;
   }
 };
@@ -3953,6 +7185,7 @@ const resolveTenantUserColumns = async (): Promise<TenantUserColumnConfig> => {
     return tenantUserColumnConfig;
   }
 
+  await ensureTenantTables();
   const prisma = getPrismaClient();
   const columns = (await prisma.$queryRawUnsafe(
     `
@@ -3990,6 +7223,7 @@ const resolveTenantId = async (tenantId?: string): Promise<string | null> => {
     return tenantId;
   }
 
+  await ensureTenantTables();
   const schemaName = getActiveSchema();
   if (!schemaName) {
     return null;
@@ -4000,7 +7234,7 @@ const resolveTenantId = async (tenantId?: string): Promise<string | null> => {
     `
       SELECT id
       FROM public.tenants
-      WHERE schema_name = $1
+      WHERE "schemaName" = $1
     `,
     schemaName
   )) as { id: string }[];
