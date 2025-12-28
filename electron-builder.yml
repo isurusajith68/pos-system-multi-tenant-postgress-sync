@@ -1,0 +1,114 @@
+appId: com.isurusajith68.zentra
+productName: Zentra POS System
+copyright: Copyright © 2025 isurusajith
+directories:
+  buildResources: build
+files:
+  - "!**/.vscode/*"
+  - "!src/*"
+  - "!electron.vite.config.{js,ts,mjs,cjs}"
+  - "!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}"
+  - "!{.env,.env.*,.npmrc,pnpm-lock.yaml}"
+  - "!{.env.local,.env.development,.env.test}"
+  - ".env.production"
+  - "!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}"
+  - "out/**/*"
+  - "src/generated/**/*"
+  - "src/renderer/src/assets/**/*"
+asarUnpack:
+  - resources/**
+  - "node_modules/@prisma/**/*"
+  - "node_modules/.prisma/**/*"
+  - "src/generated/**/*"
+extraResources:
+  - from: "prisma"
+    to: "prisma"
+  - from: "src/generated"
+    to: "generated"
+  - from: "src/renderer/src/assets"
+    to: "assets"
+win:
+  executableName: pos
+  # icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+  verifyUpdateCodeSignature: false
+  signtoolOptions:
+    publisherName: isurusajith68
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  menuCategory: Zentra
+  license: LICENSE
+  warningsAsErrors: false
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: true
+mac:
+  category: public.app-category.business
+  entitlementsInherit: build/entitlements.mac.plist
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  icon: build/icon.icns
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  extendInfo:
+    - NSCameraUsageDescription: Application requests access to the device's camera.
+    - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
+    - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
+    - NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
+  notarize: false
+dmg:
+  artifactName: ${name}-${version}.${ext}
+  title: ${productName} ${version}
+  icon: build/icon.icns
+  background: build/background.png
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+linux:
+  target:
+    - AppImage
+    - snap
+    - deb
+  maintainer: isurusajith68
+  vendor: isurusajith68
+  category: Office
+  description: Modern Point of Sale (POS) system for retail businesses
+  desktop:
+    Name: Modern POS System
+    Comment: Point of Sale system for retail businesses
+    Categories: Office;Finance;
+  icon: build/icon.png
+appImage:
+  artifactName: ${name}-${version}.${ext}
+snap:
+  summary: Modern Point of Sale system
+  description: A comprehensive POS system built with Electron, React, and TypeScript
+  grade: stable
+  confinement: strict
+deb:
+  packageCategory: office
+  priority: optional
+npmRebuild: false
+compression: maximum
+# Uncomment and configure when you have code signing certificates
+# codeSigningPolicy: default
+# afterSign: scripts/notarize.js
+publish:
+  provider: github
+  owner: isurusajith68
+  repo: pos-system-multi-tenant-postgress
+  private: false

@@ -1,0 +1,18 @@
+node_modules
+dist
+out
+.DS_Store
+.eslintcache
+*.log*
+
+/src/generated/prisma
+
+# Database files
+prisma/db/*.db
+prisma/db/*.db-journal
+prisma/db/*.db-wal
+.env
+.env.local
+.env.*.local
+.env.production
+next-update.txt

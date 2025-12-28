@@ -1,0 +1,122 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Hide spinner buttons on all number inputs */
+input::-webkit-outer-spin-button,
+input::-webkit-inner-spin-button {
+  /* display: none; <- Crashes Chrome on hover */
+  -webkit-appearance: none;
+  margin: 0; /* <-- Apparently some margin are still there even though it's hidden */
+}
+
+input[type="number"] {
+  -moz-appearance: textfield; /* Firefox */
+  appearance: textfield; /* Standard property for compatibility */
+}
+
+/* Block mouse wheel scrolling on ALL number inputs */
+input[type="number"] {
+  /* Prevent mouse wheel from changing value */
+  pointer-events: auto;
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
+  user-select: text;
+  /* Ensure text selection works properly */
+  -webkit-touch-callout: text;
+  -webkit-user-modify: read-write-plaintext-only;
+  /* Additional properties to prevent wheel scrolling */
+  overflow: hidden;
+  /* Prevent wheel events from bubbling */
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Specific rules for spinner buttons */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+
+@layer utilities {
+  .surface-card {
+    @apply bg-white border border-gray-100 text-slate-900 dark:bg-slate-900/90 dark:border-slate-800 dark:text-slate-100;
+  }
+
+  .surface-panel {
+    @apply bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100;
+  }
+
+  .surface-input {
+    @apply bg-white border border-gray-300 text-slate-900 dark:bg-slate-900/70 dark:border-slate-700 dark:text-slate-100 focus:ring-2 focus:ring-blue-500 focus:border-transparent;
+  }
+
+  .surface-kbd {
+    @apply px-2 py-1 bg-white border border-gray-300 rounded text-xs font-mono text-slate-900 dark:bg-slate-800 dark:border-slate-700 dark:text-slate-100;
+  }
+}
+
+@layer base {
+  body {
+    @apply bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100;
+  }
+
+  table {
+    @apply w-full border border-gray-200 bg-white text-slate-900 dark:border-slate-800 dark:bg-slate-900/70 dark:text-slate-100;
+  }
+
+  table th,
+  table td {
+    @apply px-3 py-2 border-b border-gray-200 dark:border-slate-800;
+  }
+
+  input,
+  select,
+  textarea {
+    @apply bg-white border border-gray-300 text-slate-900 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-slate-900/70 dark:border-slate-700 dark:text-slate-100;
+  }
+
+  .modal-surface,
+  .dropdown-surface,
+  .sidebar-panel {
+    @apply bg-white rounded-xl border border-gray-200 shadow-xl dark:bg-slate-900/90 dark:border-slate-800;
+  }
+
+  .surface-calendar {
+    @apply bg-white border border-gray-300 rounded-lg text-slate-900 dark:bg-slate-900/70 dark:border-slate-700 dark:text-slate-100;
+  }
+}
+/* Base scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+/* LIGHT MODE */
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a8a8a8;
+}
+
+/* DARK MODE */
+.dark ::-webkit-scrollbar-track {
+  background: #0f172a; /* slate-900 */
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #475569; /* slate-600 */
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #64748b; /* slate-500 */
+}

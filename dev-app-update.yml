@@ -1,0 +1,3 @@
+provider: generic
+url: https://github.com/isurusajith68/pos-system-multi-tenant-postgress/releases
+updaterCacheDirName: pos-updater
