@@ -58,43 +58,6 @@ type ProductFilters = {
   code?: string;
 };
 
-type ProductQueryCacheEntry = {
-  data?: Product[];
-  expiresAt: number;
-  inFlight?: Promise<Product[]>;
-};
-
-type ScanIndexEntry = {
-  product: Product;
-  expiresAt: number;
-};
-
-const PRODUCT_QUERY_CACHE_TTL_MS = 3000;
-const PRODUCT_QUERY_CACHE_MAX = 200;
-const SCAN_INDEX_TTL_MS = 5000;
-const SCAN_INDEX_MAX = 2000;
-
-const stableStringify = (value: unknown): string => {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-
-  if (value instanceof Date) {
-    return JSON.stringify(value.toISOString());
-  }
-
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
-  }
-
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, entryValue]) => entryValue !== undefined)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringify(entryValue)}`);
-
-  return `{${entries.join(",")}}`;
-};
-
 const POSSystem2: React.FC = () => {
   const { t } = useTranslation();
   const { currentUser: user } = useCurrentUser();
@@ -110,8 +73,6 @@ const POSSystem2: React.FC = () => {
     return [];
   });
   const [hasAutoSelectedCategory, setHasAutoSelectedCategory] = useState(false);
-  const productQueryCacheRef = useRef<Map<string, ProductQueryCacheEntry>>(new Map());
-  const scanIndexRef = useRef<Map<string, ScanIndexEntry>>(new Map());
 
   const categoryMap = useMemo(
     () => new Map(categories.map((category) => [category.id, category])),
@@ -149,122 +110,17 @@ const POSSystem2: React.FC = () => {
     return () => clearTimeout(timeout);
   }, [searchTerm]);
 
-  useEffect(() => {
-    productQueryCacheRef.current.clear();
-    scanIndexRef.current.clear();
-  }, [user?.id]);
-
-  const cacheScanProducts = useCallback((items: Product[]): void => {
-    if (items.length === 0) {
-      return;
-    }
-
-    const now = Date.now();
-    const scanIndex = scanIndexRef.current;
-
-    items.forEach((product) => {
-      if (product.barcode) {
-        scanIndex.set(product.barcode, {
-          product,
-          expiresAt: now + SCAN_INDEX_TTL_MS
-        });
-      }
-      if (product.sku) {
-        scanIndex.set(product.sku, {
-          product,
-          expiresAt: now + SCAN_INDEX_TTL_MS
-        });
-      }
-    });
-
-    for (const [key, entry] of scanIndex) {
-      if (entry.expiresAt <= now) {
-        scanIndex.delete(key);
-      }
-    }
-
-    if (scanIndex.size > SCAN_INDEX_MAX) {
-      const overflow = scanIndex.size - SCAN_INDEX_MAX;
-      const keys = scanIndex.keys();
-      for (let i = 0; i < overflow; i += 1) {
-        const next = keys.next();
-        if (next.done) {
-          break;
-        }
-        scanIndex.delete(next.value);
-      }
-    }
-  }, []);
-
-  const getCachedScanProduct = useCallback((code: string): Product | null => {
-    if (!code) {
-      return null;
-    }
-
-    const entry = scanIndexRef.current.get(code);
-    if (!entry) {
-      return null;
-    }
-
-    if (entry.expiresAt <= Date.now()) {
-      scanIndexRef.current.delete(code);
-      return null;
-    }
-
-    return entry.product;
-  }, []);
-
-  const getProductsCached = useCallback(
+  const getProducts = useCallback(
     async (options: {
       filters: ProductFilters;
       pagination?: { skip?: number; take?: number };
     }): Promise<Product[]> => {
-      const cacheKey = stableStringify(options ?? {});
-      const cache = productQueryCacheRef.current;
-      const now = Date.now();
-      const cached = cache.get(cacheKey);
-      console.log(cached);
-      if (cached?.data && cached.expiresAt > now) {
-        cacheScanProducts(cached.data);
-        return cached.data;
-      }
-
-      if (cached?.inFlight) {
-        return cached.inFlight;
-      }
-
-      const request = window.api.products.findMany(options).then((data: Product[]) => {
-        cache.set(cacheKey, {
-          data,
-          expiresAt: Date.now() + PRODUCT_QUERY_CACHE_TTL_MS
-        });
-        cacheScanProducts(data);
-        if (cache.size > PRODUCT_QUERY_CACHE_MAX) {
-          const overflow = cache.size - PRODUCT_QUERY_CACHE_MAX;
-          const keys = cache.keys();
-          for (let i = 0; i < overflow; i += 1) {
-            const next = keys.next();
-            if (next.done) {
-              break;
-            }
-            cache.delete(next.value);
-          }
-        }
-        return data;
-      });
-
-      cache.set(cacheKey, {
-        data: cached?.data,
-        expiresAt: cached?.expiresAt ?? 0,
-        inFlight: request
-      });
-
-      return request.catch((error) => {
-        cache.delete(cacheKey);
-        throw error;
+      return window.api.products.findMany({
+        ...options,
+        bypassCache: true
       });
     },
-    [cacheScanProducts]
+    []
   );
 
   const baseProductFilters = useMemo<ProductFilters>(() => {
@@ -349,10 +205,6 @@ const POSSystem2: React.FC = () => {
   // Keyboard shortcuts helper modal
   const [showShortcutsModal, setShowShortcutsModal] = useState(false);
 
-  // Cart history state
-  const [showCartHistoryModal, setShowCartHistoryModal] = useState(false);
-  const [showRestorePrompt, setShowRestorePrompt] = useState(false);
-
   // Payment confirmation modal
   const [showPaymentConfirmation, setShowPaymentConfirmation] = useState(false);
   const [isPayButtonLoading, setIsPayButtonLoading] = useState(false);
@@ -384,82 +236,6 @@ const POSSystem2: React.FC = () => {
   const customProductNameRef = useRef<HTMLInputElement>(null);
   const customProductQuantityRef = useRef<HTMLInputElement>(null);
   const customProductPriceRef = useRef<HTMLInputElement>(null);
-
-  // Cart history management
-  const saveCartToHistory = useCallback(
-    (showToast: boolean = true): void => {
-      if (cartItems.length === 0) return;
-
-      const cartHistory = {
-        cartItems,
-        totalDiscountAmount,
-        paymentMode,
-        selectedCustomer,
-        receivedAmount,
-        isPartialPayment,
-        partialPaymentAmount,
-        timestamp: new Date().toISOString()
-      };
-
-      localStorage.setItem("pos_cart_history", JSON.stringify(cartHistory));
-      if (showToast) {
-        toast.success(t("pos.toast.cartSaved") || "Cart saved successfully");
-      }
-    },
-    [
-      cartItems,
-      totalDiscountAmount,
-      paymentMode,
-      selectedCustomer,
-      receivedAmount,
-      isPartialPayment,
-      partialPaymentAmount,
-      t
-    ]
-  );
-
-  const restoreCartFromHistory = useCallback((): void => {
-    try {
-      const savedCart = localStorage.getItem("pos_cart_history");
-      if (!savedCart) {
-        toast.error(t("No saved cart found") || "No saved cart found");
-        setShowRestorePrompt(false);
-        return;
-      }
-
-      const cartHistory = JSON.parse(savedCart);
-
-      // Restore cart items with proper date parsing
-      const restoredCartItems = (cartHistory.cartItems || []).map((item: any) => ({
-        ...item,
-        createdAt: item.createdAt ? new Date(item.createdAt) : new Date(),
-        updatedAt: item.updatedAt ? new Date(item.updatedAt) : new Date()
-      }));
-
-      setCartItems(restoredCartItems);
-      setTotalDiscountAmount(cartHistory.totalDiscountAmount || 0);
-      setPaymentMode(cartHistory.paymentMode || "cash");
-      setSelectedCustomer(cartHistory.selectedCustomer || "");
-      setReceivedAmount(cartHistory.receivedAmount || "");
-      setIsPartialPayment(cartHistory.isPartialPayment || false);
-      setPartialPaymentAmount(cartHistory.partialPaymentAmount || "");
-
-      toast.success(
-        t("pos.toast.cartRestored") || `Cart restored with ${restoredCartItems.length} items`
-      );
-      setShowRestorePrompt(false);
-    } catch (error) {
-      console.error("Error restoring cart:", error);
-      toast.error(t("pos.toast.cartRestoreFailed") || "Failed to restore cart");
-      setShowRestorePrompt(false);
-    }
-  }, [t]);
-
-  const clearCartHistory = useCallback((): void => {
-    localStorage.removeItem("pos_cart_history");
-    setShowRestorePrompt(false);
-    toast.success(t("pos.toast.cartHistoryCleared") || "Cart history cleared");
-  }, [t]);
 
   const loadScannerDevices = useCallback(async (): Promise<void> => {
     try {
@@ -515,23 +291,7 @@ const POSSystem2: React.FC = () => {
       setLastScanTime(currentTime);
 
       try {
-        const cachedProduct = getCachedScanProduct(scannedCode);
-        if (cachedProduct) {
-          if (cachedProduct.stockLevel <= 0) {
-            toast.error(t("pos.toast.outOfStock", { name: cachedProduct.name }), {
-              duration: 3000,
-              position: "top-center"
-            });
-            return;
-          }
-
-          setSelectedProductForQuantity(cachedProduct);
-          setQuantityInput("1");
-          setShowQuantityModal(true);
-          return;
-        }
-
-        const exactMatches = await getProductsCached({
+        const exactMatches = await getProducts({
           filters: { code: scannedCode },
           pagination: { take: 5 }
         });
@@ -554,7 +314,7 @@ const POSSystem2: React.FC = () => {
           return;
         }
 
-        const fallbackMatches = await getProductsCached({
+        const fallbackMatches = await getProducts({
           filters: { searchTerm: scannedCode },
           pagination: { take: 5 }
         });
@@ -592,7 +352,7 @@ const POSSystem2: React.FC = () => {
         toast.error(t("pos.toast.productsLoadFailed"));
       }
     },
-    [getCachedScanProduct, getProductsCached, isInputFocused, lastScanTime, searchTerm, t]
+    [getProducts, isInputFocused, lastScanTime, searchTerm, t]
   );
 
   const applyBulkDiscount = useCallback((): void => {
@@ -701,12 +461,6 @@ const POSSystem2: React.FC = () => {
     };
 
     void loadInitialData();
-
-    // Check for saved cart history
-    const savedCart = localStorage.getItem("pos_cart_history");
-    if (savedCart) {
-      setShowRestorePrompt(true);
-    }
   }, []);
   useEffect(() => {
     if (!scannerEnabled) {
@@ -854,13 +608,13 @@ const POSSystem2: React.FC = () => {
         if (!isAllCategoriesActive && selectedCategoryIds.length === 1) {
           filters.categoryId = selectedCategoryIds[0];
         }
-        const data = await getProductsCached({ filters });
+        const data = await getProducts({ filters });
         setProducts(data);
         return;
       }
 
       const categoryRequests = selectedCategoryIds.map((categoryId) =>
-        getProductsCached({
+        getProducts({
           filters: { ...baseProductFilters, categoryId }
         })
       );
@@ -878,7 +632,7 @@ const POSSystem2: React.FC = () => {
     }
   }, [
     baseProductFilters,
-    getProductsCached,
+    getProducts,
     isAllCategoriesActive,
     selectedCategoryIds,
     t,
@@ -1088,7 +842,6 @@ const POSSystem2: React.FC = () => {
   const clearCart = useCallback((): void => {
     if (cartItems.length > 0) {
       setCartItems([]);
-      localStorage.removeItem("pos_cart_history");
       toast.success(t("pos.toast.cartCleared"));
     }
   }, [cartItems, t]);
@@ -1259,7 +1012,8 @@ const POSSystem2: React.FC = () => {
         };
 
         const invoiceResult = await window.api.salesInvoices.create(salesInvoiceData);
-        const invoiceNumber = invoiceResult?.id || `INV-${Date.now()}`;
+        const invoiceNumber =
+          invoiceResult?.invoice_id || invoiceResult?.id || `INV-${Date.now()}`;
 
         if (received > 0) {
           await window.api.payments.create({
@@ -1304,7 +1058,6 @@ const POSSystem2: React.FC = () => {
         setIsPartialPayment(false);
         setPartialPaymentAmount("");
         setPaymentMode("cash"); // Reset to default payment mode
-        localStorage.removeItem("pos_cart_history");
 
         // Customer reset
 
@@ -1467,17 +1220,7 @@ const POSSystem2: React.FC = () => {
         setShowCustomerModal(false);
         setShowQuantityModal(false);
         setShowShortcutsModal(false);
-        setShowCartHistoryModal(false);
-        setShowRestorePrompt(false);
         cancelPaymentConfirmation();
-      }
-
-      // Ctrl/Cmd + S - Save Cart
-      if ((event.ctrlKey || event.metaKey) && (event.key === "s" || event.key === "S")) {
-        event.preventDefault();
-        if (cartItems.length > 0) {
-          saveCartToHistory(true);
-        }
       }
 
       // F12 or Ctrl/Cmd + / - Show Keyboard Shortcuts Helper
@@ -1676,40 +1419,6 @@ const POSSystem2: React.FC = () => {
     setSelectedProductIndex(-1);
     productRefs.current = [];
   }, [searchTerm, selectedCategoryIds]);
-
-  // Auto-save cart before leaving page
-  useEffect(() => {
-    const handleBeforeUnload = (): void => {
-      if (cartItems.length > 0) {
-        // Auto-save cart when closing/refreshing
-        const cartHistory = {
-          cartItems,
-          totalDiscountAmount,
-          paymentMode,
-          selectedCustomer,
-          receivedAmount,
-          isPartialPayment,
-          partialPaymentAmount,
-          timestamp: new Date().toISOString()
-        };
-        localStorage.setItem("pos_cart_history", JSON.stringify(cartHistory));
-      }
-    };
-
-    window.addEventListener("beforeunload", handleBeforeUnload);
-
-    return () => {
-      window.removeEventListener("beforeunload", handleBeforeUnload);
-    };
-  }, [
-    cartItems,
-    totalDiscountAmount,
-    paymentMode,
-    selectedCustomer,
-    receivedAmount,
-    isPartialPayment,
-    partialPaymentAmount
-  ]);
 
   // Reset cart selection when cart becomes empty or items change
   useEffect(() => {
@@ -2059,28 +1768,6 @@ const POSSystem2: React.FC = () => {
               {cartItems.length} {cartItems.length === 1 ? t("item") : t("items")}
             </span>
           </div>
-             {cartItems.length > 0 && (
-              <button
-                onClick={() => saveCartToHistory(true)}
-                className="px-3 py-1.5 bg-gradient-to-r from-green-500 to-green-600 text-white rounded-lg text-xs font-semibold hover:from-green-600 hover:to-green-700 transition-all shadow-sm flex items-center gap-2"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-4 w-4"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"
-                  />
-                </svg>
-                {t("Save Cart")}
-              </button>
-            )}
         </div>
         <div className="mb-2">
           <div className="grid grid-cols-12 gap-2 text-xs font-semibold text-gray-600 dark:text-slate-300 border-b pb-2 dark:border-slate-700">
@@ -3011,102 +2698,6 @@ const POSSystem2: React.FC = () => {
       )}
 
       {/* Restore Cart Prompt Modal */}
-      {showRestorePrompt && (
-        <div
-          className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
-          style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}
-        >
-          <div className="surface-card rounded-lg p-6 w-full max-w-md">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-6 w-6 text-blue-600"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"
-                  />
-                </svg>
-              </div>
-              <h3 className="text-lg font-semibold">{t("Restore Previous Cart?")}</h3>
-            </div>
-            <p className="text-gray-600 mb-6">
-              {t("You have a saved cart from a previous session. Would you like to restore it?")}
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={restoreCartFromHistory}
-                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
-              >
-                {t("Restore Cart")}
-              </button>
-              <button
-                onClick={clearCartHistory}
-                className="flex-1 px-4 py-2 bg-gray-300 text-gray-700 rounded-lg hover:bg-gray-400 font-medium"
-              >
-                {t("Start Fresh")}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Save Cart Modal (before leaving) */}
-      {showCartHistoryModal && (
-        <div
-          className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
-          style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}
-        >
-          <div className="surface-card rounded-lg p-6 w-full max-w-md">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-12 h-12 bg-orange-100 rounded-full flex items-center justify-center">
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-6 w-6 text-orange-600"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-                  />
-                </svg>
-              </div>
-              <h3 className="text-lg font-semibold">{t("Save Cart Before Leaving?")}</h3>
-            </div>
-            <p className="text-gray-600 mb-6">
-              {t("You have items in your cart. Would you like to save them for later?")}
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={() => {
-                  saveCartToHistory(true);
-                  setShowCartHistoryModal(false);
-                }}
-                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
-              >
-                {t("Save Cart")}
-              </button>
-              <button
-                onClick={() => setShowCartHistoryModal(false)}
-                className="flex-1 px-4 py-2 bg-gray-300 text-gray-700 rounded-lg hover:bg-gray-400 font-medium"
-              >
-                {t("Don't Save")}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Payment confirmation modal */}
       {showPaymentConfirmation && (
         <div

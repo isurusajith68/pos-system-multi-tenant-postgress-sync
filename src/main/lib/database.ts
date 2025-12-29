@@ -5,7 +5,6 @@ import { validateAndFormatQuantity } from "./quantityValidation";
 import { getLocalDb } from "./local-sqlite";
 import { ensureDeviceId, getTenantId } from "./sync";
 
-const DEFAULT_DB_CONCURRENCY = 5;
 
 type PaginationOptions = {
   skip?: number;
@@ -34,6 +33,7 @@ type ProductSort = {
 type ProductFindManyOptions = FindManyOptions & {
   filters?: ProductFilters;
   sort?: ProductSort;
+  bypassCache?: boolean;
 };
 
 type InventoryFilters = {
@@ -49,92 +49,6 @@ type StockTransactionFilters = {
   dateFrom?: Date;
   dateTo?: Date;
   reason?: string;
-};
-
-const applyPagination = (query: Record<string, unknown>, pagination?: PaginationOptions): void => {
-  if (!pagination) {
-    return;
-  }
-
-  if (typeof pagination.skip === "number" && pagination.skip >= 0) {
-    query.skip = pagination.skip;
-  }
-
-  if (typeof pagination.take === "number" && pagination.take > 0) {
-    query.take = pagination.take;
-  }
-};
-
-const buildProductWhereClause = (filters?: ProductFilters): Record<string, unknown> => {
-  const whereClause: Record<string, unknown> = {};
-  const orClauses: Record<string, unknown>[] = [];
-
-  if (filters?.searchTerm) {
-    const term = filters.searchTerm.trim();
-    if (term) {
-      orClauses.push(
-        { name: { contains: term, mode: "insensitive" } },
-        { englishName: { contains: term, mode: "insensitive" } },
-        { sku: { contains: term, mode: "insensitive" } },
-        { barcode: { contains: term, mode: "insensitive" } },
-        { brand: { contains: term, mode: "insensitive" } },
-        { description: { contains: term, mode: "insensitive" } }
-      );
-    }
-  }
-
-  if (filters?.code) {
-    const code = filters.code.trim();
-    if (code) {
-      orClauses.push({ barcode: code }, { sku: code });
-    }
-  }
-
-  if (orClauses.length > 0) {
-    whereClause.OR = orClauses;
-  }
-
-  if (filters?.categoryId) {
-    whereClause.categoryId = filters.categoryId;
-  }
-
-  if (filters?.stockFilter === "inStock") {
-    whereClause.stockLevel = { gt: 0 };
-  } else if (filters?.stockFilter === "outOfStock") {
-    whereClause.stockLevel = { equals: 0 };
-  }
-
-  if (filters?.minPrice !== undefined || filters?.maxPrice !== undefined) {
-    const priceFilter: Record<string, number> = {};
-    if (filters?.minPrice !== undefined) {
-      priceFilter.gte = filters.minPrice;
-    }
-    if (filters?.maxPrice !== undefined) {
-      priceFilter.lte = filters.maxPrice;
-    }
-    whereClause.price = priceFilter;
-  }
-
-  return whereClause;
-};
-
-const buildProductOrderBy = (sort?: ProductSort): Record<string, unknown> => {
-  const field = sort?.field ?? "createdAt";
-  const direction = sort?.direction ?? "desc";
-
-  switch (field) {
-    case "name":
-      return { name: direction };
-    case "price":
-      return { price: direction };
-    case "category":
-      return { category: { name: direction } };
-    case "stock":
-      return { stockLevel: direction };
-    case "createdAt":
-    default:
-      return { createdAt: direction };
-  }
 };
 
 const stableStringify = (value: unknown): string => {
@@ -158,9 +72,6 @@ const stableStringify = (value: unknown): string => {
   return `{${entries.join(",")}}`;
 };
 
-const PRODUCT_CACHE_TTL_MS = 86400000;
-const PRODUCT_CACHE_MAX = 1000;
-
 type ProductCacheEntry = {
   data: any[];
   expiresAt: number;
@@ -174,23 +85,6 @@ const resolveProductCacheKey = (options?: ProductFindManyOptions): string => {
   return `${schemaKey}::${stableStringify(options ?? {})}`;
 };
 
-const pruneProductCache = (): void => {
-  if (productCache.size <= PRODUCT_CACHE_MAX) {
-    return;
-  }
-
-  const overflow = productCache.size - PRODUCT_CACHE_MAX;
-  const keys = productCache.keys();
-
-  for (let i = 0; i < overflow; i += 1) {
-    const next = keys.next();
-    if (next.done) {
-      break;
-    }
-    productCache.delete(next.value);
-  }
-};
-
 const clearProductCache = (schemaName?: string): void => {
   const schemaKey = schemaName ?? getActiveSchema() ?? "__public__";
   const prefix = `${schemaKey}::`;
@@ -201,6 +95,342 @@ const clearProductCache = (schemaName?: string): void => {
       productCacheInFlight.delete(key);
     }
   }
+};
+
+const mapCategoryRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.category_id,
+    parentCategoryId: row.parent_category_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+};
+
+const mapProductImageRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.image_id,
+    productId: row.product_id,
+    altText: row.alt_text,
+    isPrimary: Boolean(row.is_primary),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+};
+
+const mapProductTagRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.tag_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+};
+
+const mapProductTagMapRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    productId: row.product_id,
+    tagId: row.tag_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    tag: row.tag ? mapProductTagRowFromDb(row.tag) : null
+  };
+};
+
+const mapProductRowFromDb = (
+  row: any,
+  related?: { category?: any; images?: any[]; productTags?: any[] }
+): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.product_id,
+    englishName: row.english_name,
+    categoryId: row.category_id,
+    costPrice: row.cost_price,
+    discountedPrice: row.discounted_price,
+    taxInclusivePrice: row.tax_inclusive_price,
+    taxRate: row.tax_rate,
+    unitSize: row.unit_size,
+    unitType: row.unit_type,
+    stockLevel: Number(row.stock_level ?? 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    category: related?.category ? mapCategoryRowFromDb(related.category) : null,
+    images: (related?.images ?? []).map(mapProductImageRowFromDb),
+    productTags: (related?.productTags ?? []).map(mapProductTagMapRowFromDb)
+  };
+};
+
+const mapEmployeeRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    employeeId: row.employee_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+};
+
+const mapCustomerRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.customer_id,
+    loyaltyPoints: row.loyalty_points,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+};
+
+const mapPaymentRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.payment_id,
+    invoiceId: row.invoice_id,
+    paymentMode: row.payment_mode,
+    employeeId: row.employee_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+};
+
+const mapInventoryRowFromDb = (row: any, related?: { product?: any; category?: any }): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.inventory_id,
+    productId: row.product_id,
+    reorderLevel: row.reorder_level,
+    batchNumber: row.batch_number,
+    expiryDate: row.expiry_date,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    product: related?.product
+      ? mapProductRowFromDb(related.product, { category: related?.category })
+      : null
+  };
+};
+
+const mapStockTransactionRowFromDb = (
+  row: any,
+  related?: { product?: any; category?: any }
+): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.transaction_id,
+    productId: row.product_id,
+    changeQty: row.change_qty,
+    relatedInvoiceId: row.related_invoice_id,
+    transactionDate: row.transaction_date,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    product: related?.product
+      ? mapProductRowFromDb(related.product, { category: related?.category })
+      : null
+  };
+};
+
+const mapSupplierRowFromDb = (row: any, related?: { purchaseOrders?: any[] }): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.supplier_id,
+    contactName: row.contact_name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    purchaseOrders: related?.purchaseOrders ?? []
+  };
+};
+
+const mapRoleRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.role_id,
+    isSystem: Boolean(row.is_system),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+};
+
+const mapPermissionRowFromDb = (row: any): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.permission_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at
+  };
+};
+
+const mapPurchaseOrderItemRowFromDb = (
+  row: any,
+  related?: { product?: any; category?: any }
+): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.po_item_id,
+    poId: row.po_id,
+    productId: row.product_id,
+    unitPrice: row.unit_price,
+    receivedDate: row.received_date,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    product: related?.product
+      ? mapProductRowFromDb(related.product, { category: related?.category })
+      : null
+  };
+};
+
+const mapPurchaseOrderRowFromDb = (
+  row: any,
+  related?: { supplier?: any; items?: any[] }
+): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.po_id,
+    supplierId: row.supplier_id,
+    orderDate: row.order_date,
+    totalAmount: row.total_amount,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    supplier: related?.supplier ? mapSupplierRowFromDb(related.supplier) : null,
+    items: related?.items ?? []
+  };
+};
+
+const mapSalesDetailRowFromDb = (
+  row: any,
+  related?: { product?: any; customProduct?: any }
+): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.sales_detail_id,
+    invoiceId: row.invoice_id,
+    productId: row.product_id,
+    customProductId: row.custom_product_id,
+    unitPrice: row.unit_price,
+    taxRate: row.tax_rate,
+    originalPrice: row.original_price,
+    costPrice: row.cost_price,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    product: related?.product ?? null,
+    customProduct: related?.customProduct ?? null
+  };
+};
+
+const mapSalesInvoiceRowFromDb = (
+  row: any,
+  related?: {
+    customer?: any;
+    employee?: any;
+    payments?: any[];
+    salesDetails?: any[];
+  }
+): any => {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    id: row.invoice_id,
+    customerId: row.customer_id,
+    employeeId: row.employee_id,
+    subTotal: row.sub_total,
+    totalAmount: row.total_amount,
+    paymentMode: row.payment_mode,
+    taxAmount: row.tax_amount,
+    discountAmount: row.discount_amount,
+    amountReceived: row.amount_received,
+    outstandingBalance: row.outstanding_balance,
+    paymentStatus: row.payment_status,
+    refundInvoiceId: row.refund_invoice_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deletedAt: row.deleted_at,
+    customer: related?.customer ?? null,
+    employee: related?.employee ?? null,
+    payments: related?.payments ?? [],
+    salesDetails: related?.salesDetails ?? []
+  };
 };
 
 const SETTINGS_CACHE_TTL_MS = 30000;
@@ -311,123 +541,6 @@ const updateLocalProductStockLevel = (productId: string, newStockLevel: number):
   ).run(newStockLevel, nowIso(), productId);
 };
 
-const buildInventoryWhereClause = async (
-  prisma: ReturnType<typeof getPrismaClient>,
-  filters?: InventoryFilters
-): Promise<Record<string, unknown>> => {
-  const whereClause: Record<string, unknown> = {};
-  const orClauses: Record<string, unknown>[] = [];
-
-  if (filters?.productId) {
-    whereClause.productId = filters.productId;
-  }
-
-  if (filters?.searchTerm) {
-    const term = filters.searchTerm.trim();
-    if (term) {
-      orClauses.push(
-        { batchNumber: { contains: term, mode: "insensitive" } },
-        { product: { name: { contains: term, mode: "insensitive" } } },
-        { product: { englishName: { contains: term, mode: "insensitive" } } },
-        { product: { sku: { contains: term, mode: "insensitive" } } },
-        { product: { barcode: { contains: term, mode: "insensitive" } } }
-      );
-    }
-  }
-
-  if (filters?.expiringSoon) {
-    const expiryThreshold = new Date();
-    expiryThreshold.setDate(expiryThreshold.getDate() + 7);
-    whereClause.expiryDate = { lte: expiryThreshold };
-  }
-
-  if (filters?.lowStock) {
-    const lowStockRows = await prisma.$queryRaw<{ id: string }[]>`
-      SELECT inventory_id AS id
-      FROM inventory
-      WHERE quantity <= reorder_level
-    `;
-    whereClause.id = { in: lowStockRows.map((row) => row.id) };
-  }
-
-  if (orClauses.length > 0) {
-    whereClause.OR = orClauses;
-  }
-
-  return whereClause;
-};
-
-const buildStockTransactionWhereClause = (
-  filters?: StockTransactionFilters
-): Record<string, unknown> => {
-  const whereClause: Record<string, unknown> = {};
-  const orClauses: Record<string, unknown>[] = [];
-
-  if (filters?.productId) {
-    whereClause.productId = filters.productId;
-  }
-
-  if (filters?.reason) {
-    whereClause.reason = { contains: filters.reason, mode: "insensitive" };
-  }
-
-  if (filters?.dateFrom || filters?.dateTo) {
-    const dateFilter: Record<string, Date> = {};
-    if (filters.dateFrom) {
-      dateFilter.gte = filters.dateFrom;
-    }
-    if (filters.dateTo) {
-      dateFilter.lte = filters.dateTo;
-    }
-    whereClause.transactionDate = dateFilter;
-  }
-
-  if (filters?.searchTerm) {
-    const term = filters.searchTerm.trim();
-    if (term) {
-      orClauses.push(
-        { reason: { contains: term, mode: "insensitive" } },
-        { product: { name: { contains: term, mode: "insensitive" } } },
-        { product: { englishName: { contains: term, mode: "insensitive" } } },
-        { product: { sku: { contains: term, mode: "insensitive" } } }
-      );
-    }
-  }
-
-  if (orClauses.length > 0) {
-    whereClause.OR = orClauses;
-  }
-
-  return whereClause;
-};
-
-async function runWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  task: (item: T, index: number) => Promise<R>
-): Promise<R[]> {
-  if (items.length === 0) {
-    return [];
-  }
-
-  const safeLimit = Math.max(1, limit);
-  const results: R[] = new Array(items.length);
-  let nextIndex = 0;
-
-  const worker = async (): Promise<void> => {
-    while (true) {
-      const current = nextIndex++;
-      if (current >= items.length) {
-        return;
-      }
-      results[current] = await task(items[current], current);
-    }
-  };
-
-  const workerCount = Math.min(safeLimit, items.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
-}
 
 // Centralized stock level update utility
 export const updateProductStockLevel = async (
@@ -512,7 +625,9 @@ export const categoryService = {
     }
 
     const subRows = db
-      .prepare("SELECT * FROM categories WHERE deleted_at IS NULL AND parent_category_id IS NOT NULL")
+      .prepare(
+        "SELECT * FROM categories WHERE deleted_at IS NULL AND parent_category_id IS NOT NULL"
+      )
       .all();
     const subMap = new Map<string, any[]>();
     for (const sub of subRows) {
@@ -605,6 +720,7 @@ export const categoryService = {
     );
 
     enqueueOutbox("categories", row.category_id, "insert", row.version, row);
+    clearProductCache();
 
     const parent = row.parent_category_id
       ? db
@@ -674,6 +790,7 @@ export const categoryService = {
     );
 
     enqueueOutbox("categories", id, "update", row.version, row);
+    clearProductCache();
 
     const parent = row.parent_category_id
       ? db
@@ -693,7 +810,7 @@ export const categoryService = {
 
   delete: async (id: string) => {
     const db = getLocalDb();
-    console.log(id,"id_category")
+    console.log(id, "id_category");
     const existing = db
       .prepare("SELECT * FROM categories WHERE category_id = ? AND deleted_at IS NULL")
       .get(id);
@@ -721,6 +838,7 @@ export const categoryService = {
       last_modified_by_device_id: deviceId
     };
     enqueueOutbox("categories", id, "delete", version, payload);
+    clearProductCache();
 
     return payload;
   }
@@ -728,30 +846,9 @@ export const categoryService = {
 
 export const productService = {
   findMany: async (options?: ProductFindManyOptions) => {
-    // console.log("new request")
-    const cacheKey = resolveProductCacheKey(options);
-    const now = Date.now();
-    const cached = productCache.get(cacheKey);
-    if (cached && cached.expiresAt > now) {
-      // console.log("[productService.findMany] cache hit", { cacheKey, options });
-      return cached.data;
-    }
-    if (cached) {
-      productCache.delete(cacheKey);
-      // console.log("[productService.findMany] cache expired, removed", { cacheKey });
-    }
-
-    const inFlight = productCacheInFlight.get(cacheKey);
-    if (inFlight) {
-      // console.log("[productService.findMany] awaiting in-flight request", { cacheKey });
-      return inFlight;
-    }
-
-    const promise = (async () => {
+    const fetchProductsFromDb = async (): Promise<any[]> => {
       const db = getLocalDb();
-      const rawRows = db
-        .prepare("SELECT * FROM products WHERE deleted_at IS NULL")
-        .all() as any[];
+      const rawRows = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all() as any[];
 
       const applyFilters = (rows: any[]): any[] => {
         let filtered = rows;
@@ -894,13 +991,39 @@ export const productService = {
         productTagMap.set(mapping.product_id, list);
       }
 
-      return rows.map((row) => ({
-        ...row,
-        category: categoryMap.get(row.category_id) ?? null,
-        images: imagesMap.get(row.product_id) ?? [],
-        productTags: productTagMap.get(row.product_id) ?? []
-      }));
-    })();
+      return rows.map((row) =>
+        mapProductRowFromDb(row, {
+          category: categoryMap.get(row.category_id) ?? null,
+          images: imagesMap.get(row.product_id) ?? [],
+          productTags: productTagMap.get(row.product_id) ?? []
+        })
+      );
+    };
+
+    if (options?.bypassCache) {
+      return await fetchProductsFromDb();
+    }
+
+    // console.log("new request")
+    const cacheKey = resolveProductCacheKey(options);
+    const now = Date.now();
+    const cached = productCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      // console.log("[productService.findMany] cache hit", { cacheKey, options });
+      return cached.data;
+    }
+    if (cached) {
+      productCache.delete(cacheKey);
+      // console.log("[productService.findMany] cache expired, removed", { cacheKey });
+    }
+
+    const inFlight = productCacheInFlight.get(cacheKey);
+    if (inFlight) {
+      // console.log("[productService.findMany] awaiting in-flight request", { cacheKey });
+      return inFlight;
+    }
+
+    const promise = fetchProductsFromDb();
 
     productCacheInFlight.set(cacheKey, promise);
     return promise.catch((error) => {
@@ -911,9 +1034,7 @@ export const productService = {
   },
   count: async (filters?: ProductFilters) => {
     const db = getLocalDb();
-    const rows = db
-      .prepare("SELECT * FROM products WHERE deleted_at IS NULL")
-      .all() as any[];
+    const rows = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all() as any[];
     const filtered = rows.filter((row) => {
       if (filters?.searchTerm) {
         const term = filters.searchTerm.trim().toLowerCase();
@@ -996,8 +1117,7 @@ export const productService = {
       unit_size: data.unitSize ?? null,
       unit_type: data.unitType ?? null,
       unit: data.unit ?? null,
-      stock_level:
-        data.stockLevel !== undefined ? validateAndFormatQuantity(data.stockLevel) : 0,
+      stock_level: data.stockLevel !== undefined ? validateAndFormatQuantity(data.stockLevel) : 0,
       version: 1,
       created_at: timestamp,
       updated_at: timestamp,
@@ -1063,12 +1183,11 @@ export const productService = {
     enqueueOutbox("products", row.product_id, "insert", row.version, row);
     clearProductCache();
 
-    return {
-      ...row,
+    return mapProductRowFromDb(row, {
       category,
       images: [],
       productTags: []
-    };
+    });
   },
 
   update: async (
@@ -1210,15 +1329,14 @@ export const productService = {
       : [];
     const tagMap = new Map(tags.map((tag: any) => [tag.tag_id, tag]));
 
-    return {
-      ...row,
-      category: category ?? null,
+    return mapProductRowFromDb(row, {
+      category,
       images,
       productTags: tagMaps.map((mapping: any) => ({
         ...mapping,
         tag: tagMap.get(mapping.tag_id) ?? null
       }))
-    };
+    });
   },
 
   delete: async (id: string) => {
@@ -1257,6 +1375,125 @@ export const productService = {
     const deviceId = ensureDeviceId();
     const deletedAt = nowIso();
     const version = Number(product.version ?? 1) + 1;
+
+    const inventoryRows = db
+      .prepare("SELECT * FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
+      .all(id);
+    for (const inventory of inventoryRows) {
+      const invVersion = Number(inventory.version ?? 1) + 1;
+      const invRow = {
+        ...inventory,
+        deleted_at: deletedAt,
+        version: invVersion,
+        updated_at: deletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE inventory
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE inventory_id = ?
+        `
+      ).run(
+        invRow.deleted_at,
+        invRow.version,
+        invRow.updated_at,
+        invRow.last_modified_by_device_id,
+        invRow.inventory_id
+      );
+      enqueueOutbox("inventory", invRow.inventory_id, "delete", invRow.version, invRow);
+    }
+
+    const stockTransactions = db
+      .prepare("SELECT * FROM stock_transactions WHERE product_id = ? AND deleted_at IS NULL")
+      .all(id);
+    for (const transaction of stockTransactions) {
+      const txVersion = Number(transaction.version ?? 1) + 1;
+      const txRow = {
+        ...transaction,
+        deleted_at: deletedAt,
+        version: txVersion,
+        updated_at: deletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE stock_transactions
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE transaction_id = ?
+        `
+      ).run(
+        txRow.deleted_at,
+        txRow.version,
+        txRow.updated_at,
+        txRow.last_modified_by_device_id,
+        txRow.transaction_id
+      );
+      enqueueOutbox("stock_transactions", txRow.transaction_id, "delete", txRow.version, txRow);
+    }
+
+    const images = db
+      .prepare("SELECT * FROM product_images WHERE product_id = ? AND deleted_at IS NULL")
+      .all(id);
+    for (const image of images) {
+      const imgVersion = Number(image.version ?? 1) + 1;
+      const imgRow = {
+        ...image,
+        deleted_at: deletedAt,
+        version: imgVersion,
+        updated_at: deletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE product_images
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE image_id = ?
+        `
+      ).run(
+        imgRow.deleted_at,
+        imgRow.version,
+        imgRow.updated_at,
+        imgRow.last_modified_by_device_id,
+        imgRow.image_id
+      );
+      enqueueOutbox("product_images", imgRow.image_id, "delete", imgRow.version, imgRow);
+    }
+
+    const tagMaps = db
+      .prepare("SELECT * FROM product_tag_map WHERE product_id = ? AND deleted_at IS NULL")
+      .all(id);
+    for (const mapping of tagMaps) {
+      const mapVersion = Number(mapping.version ?? 1) + 1;
+      const mapRow = {
+        ...mapping,
+        deleted_at: deletedAt,
+        version: mapVersion,
+        updated_at: deletedAt,
+        last_modified_by_device_id: deviceId
+      };
+      db.prepare(
+        `
+          UPDATE product_tag_map
+          SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+          WHERE product_id = ? AND tag_id = ?
+        `
+      ).run(
+        mapRow.deleted_at,
+        mapRow.version,
+        mapRow.updated_at,
+        mapRow.last_modified_by_device_id,
+        mapRow.product_id,
+        mapRow.tag_id
+      );
+      enqueueOutbox(
+        "product_tag_map",
+        buildCompositeRowId({ product_id: mapRow.product_id, tag_id: mapRow.tag_id }),
+        "delete",
+        mapRow.version,
+        mapRow
+      );
+    }
 
     db.prepare(
       `
@@ -1347,11 +1584,53 @@ export const employeeService = {
     password_hash: string;
   }) => {
     const db = getLocalDb();
-    const existingEmail = db
-      .prepare("SELECT id FROM employee WHERE email = ? AND deleted_at IS NULL")
-      .get(data.email);
-    if (existingEmail) {
-      throw new Error(`Employee with email "${data.email}" already exists`);
+    const existing = db.prepare("SELECT * FROM employee WHERE email = ?").get(data.email);
+    if (existing) {
+      if (!existing.deleted_at) {
+        throw new Error(`Employee with email "${data.email}" already exists`);
+      }
+
+      const deviceId = ensureDeviceId();
+      const updatedAt = nowIso();
+      const version = Number(existing.version ?? 1) + 1;
+      const row = {
+        ...existing,
+        employee_id: data.employee_id,
+        name: data.name,
+        role: data.role,
+        address: data.address ?? null,
+        password_hash: data.password_hash,
+        version,
+        updated_at: updatedAt,
+        deleted_at: null,
+        last_modified_by_device_id: deviceId
+      };
+
+      db.prepare(
+        `
+          UPDATE employee
+          SET employee_id = ?, name = ?, role = ?, address = ?, password_hash = ?,
+              version = ?, updated_at = ?, deleted_at = ?, last_modified_by_device_id = ?
+          WHERE id = ?
+        `
+      ).run(
+        row.employee_id,
+        row.name,
+        row.role,
+        row.address,
+        row.password_hash,
+        row.version,
+        row.updated_at,
+        row.deleted_at,
+        row.last_modified_by_device_id,
+        row.id
+      );
+
+      enqueueOutbox("employee", row.id, "update", row.version, row);
+      return {
+        ...row,
+        employeeRoles: []
+      };
     }
 
     const employeeId = randomUUID();
@@ -1426,9 +1705,14 @@ export const employeeService = {
     const db = getLocalDb();
     const roleRecord = data.roleId
       ? db
-          .prepare("SELECT role_id, name, description, is_system FROM roles WHERE role_id = ? AND deleted_at IS NULL")
+          .prepare(
+            "SELECT role_id, name, description, is_system FROM roles WHERE role_id = ? AND deleted_at IS NULL"
+          )
           .get(data.roleId)
       : null;
+    if (data.roleId && !roleRecord) {
+      throw new Error(`Role not found for id "${data.roleId}"`);
+    }
     const assignedRoleName = roleRecord?.name ?? "";
 
     const employee = await employeeService.create({
@@ -1442,52 +1726,91 @@ export const employeeService = {
 
     let employeeRoles: any[] = [];
     if (data.roleId) {
-      const timestamp = nowIso();
-      const row = {
-        employee_id: employee.id,
-        role_id: data.roleId,
-        assigned_at: timestamp,
-        assigned_by: null,
-        version: 1,
-        created_at: timestamp,
-        updated_at: timestamp,
-        deleted_at: null,
-        last_modified_by_device_id: ensureDeviceId()
-      };
-      db.prepare(
-        `
-          INSERT INTO employee_roles (
-            employee_id,
-            role_id,
-            assigned_at,
-            assigned_by,
-            version,
-            created_at,
-            updated_at,
-            deleted_at,
-            last_modified_by_device_id
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `
-      ).run(
-        row.employee_id,
-        row.role_id,
-        row.assigned_at,
-        row.assigned_by,
-        row.version,
-        row.created_at,
-        row.updated_at,
-        row.deleted_at,
-        row.last_modified_by_device_id
-      );
+      const existingRole = db
+        .prepare("SELECT * FROM employee_roles WHERE employee_id = ? AND role_id = ?")
+        .get(employee.id, data.roleId);
 
-      enqueueOutbox(
-        "employee_roles",
-        buildCompositeRowId({ employee_id: row.employee_id, role_id: row.role_id }),
-        "insert",
-        row.version,
-        row
-      );
+      if (existingRole) {
+        if (existingRole.deleted_at) {
+          const updatedAt = nowIso();
+          const version = Number(existingRole.version ?? 1) + 1;
+          const row = {
+            ...existingRole,
+            deleted_at: null,
+            version,
+            updated_at: updatedAt,
+            last_modified_by_device_id: ensureDeviceId()
+          };
+          db.prepare(
+            `
+              UPDATE employee_roles
+              SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+              WHERE employee_id = ? AND role_id = ?
+            `
+          ).run(
+            row.deleted_at,
+            row.version,
+            row.updated_at,
+            row.last_modified_by_device_id,
+            row.employee_id,
+            row.role_id
+          );
+          enqueueOutbox(
+            "employee_roles",
+            buildCompositeRowId({ employee_id: row.employee_id, role_id: row.role_id }),
+            "update",
+            row.version,
+            row
+          );
+        }
+      } else {
+        const timestamp = nowIso();
+        const row = {
+          employee_id: employee.id,
+          role_id: data.roleId,
+          assigned_at: timestamp,
+          assigned_by: null,
+          version: 1,
+          created_at: timestamp,
+          updated_at: timestamp,
+          deleted_at: null,
+          last_modified_by_device_id: ensureDeviceId()
+        };
+        db.prepare(
+          `
+            INSERT INTO employee_roles (
+              employee_id,
+              role_id,
+              assigned_at,
+              assigned_by,
+              version,
+              created_at,
+              updated_at,
+              deleted_at,
+              last_modified_by_device_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        ).run(
+          row.employee_id,
+          row.role_id,
+          row.assigned_at,
+          row.assigned_by,
+          row.version,
+          row.created_at,
+          row.updated_at,
+          row.deleted_at,
+          row.last_modified_by_device_id
+        );
+
+        enqueueOutbox(
+          "employee_roles",
+          buildCompositeRowId({ employee_id: row.employee_id, role_id: row.role_id }),
+          "insert",
+          row.version,
+          row
+        );
+      }
 
       employeeRoles = [
         {
@@ -1644,7 +1967,10 @@ export const employeeService = {
         const roleRecord = db
           .prepare("SELECT name FROM roles WHERE role_id = ? AND deleted_at IS NULL")
           .get(data.roleId);
-        assignedRoleName = roleRecord?.name ?? "";
+        if (!roleRecord) {
+          throw new Error(`Role not found for id "${data.roleId}"`);
+        }
+        assignedRoleName = roleRecord.name ?? "";
       } else {
         assignedRoleName = "";
       }
@@ -1772,7 +2098,7 @@ export const employeeService = {
     await upsertTenantUser({
       tenantId: data.tenantId,
       email: data.email,
-      passwordHash: data.password_hash,
+      passwordHash: data.password_hash ?? existing.password_hash,
       previousEmail: data.previousEmail
     });
 
@@ -1878,9 +2204,7 @@ export const employeeService = {
 
   findByEmail: async (email: string) => {
     const db = getLocalDb();
-    return db
-      .prepare("SELECT * FROM employee WHERE email = ? AND deleted_at IS NULL")
-      .get(email);
+    return db.prepare("SELECT * FROM employee WHERE email = ? AND deleted_at IS NULL").get(email);
   },
 
   findByEmailOnline: async (email: string, schemaName: string) => {
@@ -1928,6 +2252,115 @@ export const employeeService = {
       console.error("Error hashing password:", error);
       throw new Error("Failed to hash password");
     }
+  }
+};
+
+export const credentialCacheService = {
+  findByEmail: async (email: string) => {
+    const db = getLocalDb();
+    return (
+      db
+        .prepare("SELECT * FROM credential_cache WHERE LOWER(email) = LOWER(?)")
+        .get(email) ?? null
+    );
+  },
+
+  upsert: async (data: {
+    userId: string;
+    email: string;
+    passwordHash: string;
+    roles?: string | null;
+    lastVerifiedAt: string;
+    expiresAt: string;
+  }) => {
+    const db = getLocalDb();
+    const normalizedEmail = data.email.trim().toLowerCase();
+    const existing = db
+      .prepare("SELECT user_id FROM credential_cache WHERE LOWER(email) = LOWER(?)")
+      .get(normalizedEmail);
+
+    if (existing) {
+      db.prepare(
+        `
+          UPDATE credential_cache
+          SET user_id = ?, password_hash = ?, roles = ?, last_verified_at = ?, expires_at = ?, failed_attempts = 0
+          WHERE LOWER(email) = LOWER(?)
+        `
+      ).run(
+        data.userId,
+        data.passwordHash,
+        data.roles ?? null,
+        data.lastVerifiedAt,
+        data.expiresAt,
+        normalizedEmail
+      );
+      return;
+    }
+
+    db.prepare(
+      `
+        INSERT INTO credential_cache (
+          user_id,
+          email,
+          password_hash,
+          roles,
+          last_verified_at,
+          expires_at,
+          failed_attempts
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+      `
+    ).run(
+      data.userId,
+      normalizedEmail,
+      data.passwordHash,
+      data.roles ?? null,
+      data.lastVerifiedAt,
+      data.expiresAt
+    );
+  },
+
+  recordFailedAttempt: async (email: string) => {
+    const db = getLocalDb();
+    db.prepare(
+      `
+        UPDATE credential_cache
+        SET failed_attempts = failed_attempts + 1
+        WHERE LOWER(email) = LOWER(?)
+      `
+    ).run(email);
+  },
+
+  resetFailedAttempts: async (email: string) => {
+    const db = getLocalDb();
+    db.prepare(
+      `
+        UPDATE credential_cache
+        SET failed_attempts = 0
+        WHERE LOWER(email) = LOWER(?)
+      `
+    ).run(email);
+  }
+};
+
+export const localMetaService = {
+  get: async (key: string): Promise<string | null> => {
+    const db = getLocalDb();
+    const row = db.prepare("SELECT value FROM local_meta WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value ?? null;
+  },
+
+  set: async (key: string, value: string): Promise<void> => {
+    const db = getLocalDb();
+    db.prepare(
+      `
+        INSERT INTO local_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `
+    ).run(key, value);
   }
 };
 
@@ -2070,29 +2503,44 @@ export const salesInvoiceService = {
         paymentStatus = totalPaid > 0 ? "partial" : "unpaid";
       }
 
-      return {
-        ...invoice,
-        customer: invoice.customer_id ? customerMap.get(invoice.customer_id) ?? null : null,
-        employee: invoice.employee_id ? employeeMap.get(invoice.employee_id) ?? null : null,
-        payments: paymentsForInvoice.map((payment: any) => ({
-          ...payment,
-          employee: payment.employee_id ? employeeMap.get(payment.employee_id) ?? null : null
-        })),
-        salesDetails: (detailMap.get(invoice.invoice_id) ?? []).map((detail: any) => ({
-          ...detail,
-          product: detail.product_id
-            ? {
-                ...productMap.get(detail.product_id),
-                category: categoryMap.get(productMap.get(detail.product_id)?.category_id) ?? null
-              }
-            : null,
-          customProduct: detail.custom_product_id
-            ? customProductMap.get(detail.custom_product_id) ?? null
-            : null
-        })),
+      return mapSalesInvoiceRowFromDb(invoice, {
+        customer: invoice.customer_id
+          ? mapCustomerRowFromDb(customerMap.get(invoice.customer_id))
+          : null,
+        employee: invoice.employee_id
+          ? mapEmployeeRowFromDb(employeeMap.get(invoice.employee_id))
+          : null,
+        payments: paymentsForInvoice.map((payment: any) =>
+          mapPaymentRowFromDb({
+            ...payment,
+            employee: payment.employee_id
+              ? mapEmployeeRowFromDb(employeeMap.get(payment.employee_id))
+              : null
+          })
+        ),
+        salesDetails: (detailMap.get(invoice.invoice_id) ?? []).map((detail: any) =>
+          mapSalesDetailRowFromDb(detail, {
+            product: detail.product_id
+              ? mapProductRowFromDb(
+                  {
+                    ...productMap.get(detail.product_id),
+                    category:
+                      categoryMap.get(productMap.get(detail.product_id)?.category_id) ?? null
+                  },
+                  {
+                    category:
+                      categoryMap.get(productMap.get(detail.product_id)?.category_id) ?? null
+                  }
+                )
+              : null,
+            customProduct: detail.custom_product_id
+              ? (customProductMap.get(detail.custom_product_id) ?? null)
+              : null
+          })
+        ),
         outstandingBalance,
         paymentStatus
-      };
+      });
     });
   },
 
@@ -2157,18 +2605,16 @@ export const salesInvoiceService = {
       }
     }
 
-    const lastInvoice = db
-      .prepare("SELECT invoice_id FROM sales_invoices WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 1")
-      .get();
-
-    let nextInvoiceNumber = 1000;
-    if (lastInvoice) {
-      const match = String(lastInvoice.invoice_id ?? "").match(/^INV-(\d+)$/);
-      if (match) {
-        nextInvoiceNumber = Number(match[1]) + 1;
-      }
-    }
-
+    const maxRow = db
+      .prepare(
+        `
+          SELECT MAX(CAST(SUBSTR(invoice_id, 5) AS INTEGER)) AS max_id
+          FROM sales_invoices
+          WHERE invoice_id LIKE 'INV-%'
+        `
+      )
+      .get() as { max_id?: number };
+    const nextInvoiceNumber = Number(maxRow?.max_id ?? 999) + 1;
     const invoiceNumber = `INV-${nextInvoiceNumber}`;
     const timestamp = nowIso();
     const invoiceRow = {
@@ -2237,7 +2683,13 @@ export const salesInvoiceService = {
       invoiceRow.last_modified_by_device_id
     );
 
-    enqueueOutbox("sales_invoices", invoiceRow.invoice_id, "insert", invoiceRow.version, invoiceRow);
+    enqueueOutbox(
+      "sales_invoices",
+      invoiceRow.invoice_id,
+      "insert",
+      invoiceRow.version,
+      invoiceRow
+    );
 
     const productIds = Array.from(
       new Set(
@@ -2319,7 +2771,13 @@ export const salesInvoiceService = {
         detailRow.last_modified_by_device_id
       );
 
-      enqueueOutbox("sales_details", detailRow.sales_detail_id, "insert", detailRow.version, detailRow);
+      enqueueOutbox(
+        "sales_details",
+        detailRow.sales_detail_id,
+        "insert",
+        detailRow.version,
+        detailRow
+      );
 
       if (!detail.productId) {
         continue;
@@ -2482,7 +2940,13 @@ export const salesInvoiceService = {
           customerRow.last_modified_by_device_id,
           customerRow.customer_id
         );
-        enqueueOutbox("customers", customerRow.customer_id, "update", customerRow.version, customerRow);
+        enqueueOutbox(
+          "customers",
+          customerRow.customer_id,
+          "update",
+          customerRow.version,
+          customerRow
+        );
 
         const ctRow = {
           customer_id: data.customerId,
@@ -2653,7 +3117,13 @@ export const salesInvoiceService = {
         detailRow.last_modified_by_device_id,
         detailRow.sales_detail_id
       );
-      enqueueOutbox("sales_details", detailRow.sales_detail_id, "delete", detailRow.version, detailRow);
+      enqueueOutbox(
+        "sales_details",
+        detailRow.sales_detail_id,
+        "delete",
+        detailRow.version,
+        detailRow
+      );
     }
 
     const customerTransactions = db
@@ -2711,7 +3181,13 @@ export const salesInvoiceService = {
           SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
           WHERE payment_id = ?
         `
-      ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, row.payment_id);
+      ).run(
+        row.deleted_at,
+        row.version,
+        row.updated_at,
+        row.last_modified_by_device_id,
+        row.payment_id
+      );
       enqueueOutbox("payments", row.payment_id, "delete", row.version, row);
     }
 
@@ -2739,16 +3215,31 @@ export const salesInvoiceService = {
       invoiceRow.invoice_id
     );
 
-    enqueueOutbox("sales_invoices", invoiceRow.invoice_id, "delete", invoiceRow.version, invoiceRow);
+    enqueueOutbox(
+      "sales_invoices",
+      invoiceRow.invoice_id,
+      "delete",
+      invoiceRow.version,
+      invoiceRow
+    );
     clearProductCache();
     return invoiceRow;
   },
 
   getStats: async (filters?: { dateFrom?: string; dateTo?: string }) => {
     const rows = await salesInvoiceService.getFiltered(filters);
-    const totalRevenue = rows.reduce((sum: number, invoice: any) => sum + Number(invoice.total_amount), 0);
-    const totalDiscount = rows.reduce((sum: number, invoice: any) => sum + Number(invoice.discount_amount), 0);
-    const totalTax = rows.reduce((sum: number, invoice: any) => sum + Number(invoice.tax_amount), 0);
+    const totalRevenue = rows.reduce(
+      (sum: number, invoice: any) => sum + Number(invoice.total_amount),
+      0
+    );
+    const totalDiscount = rows.reduce(
+      (sum: number, invoice: any) => sum + Number(invoice.discount_amount),
+      0
+    );
+    const totalTax = rows.reduce(
+      (sum: number, invoice: any) => sum + Number(invoice.tax_amount),
+      0
+    );
     const totalInvoices = rows.length;
     const averageOrderValue = totalInvoices > 0 ? totalRevenue / totalInvoices : 0;
 
@@ -2922,7 +3413,13 @@ export const salesInvoiceService = {
         detailRow.last_modified_by_device_id
       );
 
-      enqueueOutbox("sales_details", detailRow.sales_detail_id, "insert", detailRow.version, detailRow);
+      enqueueOutbox(
+        "sales_details",
+        detailRow.sales_detail_id,
+        "insert",
+        detailRow.version,
+        detailRow
+      );
 
       if (detail.product_id) {
         const inventory = db
@@ -3034,7 +3531,13 @@ export const salesInvoiceService = {
           customerRow.last_modified_by_device_id,
           customerRow.customer_id
         );
-        enqueueOutbox("customers", customerRow.customer_id, "update", customerRow.version, customerRow);
+        enqueueOutbox(
+          "customers",
+          customerRow.customer_id,
+          "update",
+          customerRow.version,
+          customerRow
+        );
 
         const existingTx = db
           .prepare(
@@ -3100,9 +3603,18 @@ export const salesInvoiceService = {
       originalRow.invoice_id
     );
 
-    enqueueOutbox("sales_invoices", originalRow.invoice_id, "update", originalRow.version, originalRow);
+    enqueueOutbox(
+      "sales_invoices",
+      originalRow.invoice_id,
+      "update",
+      originalRow.version,
+      originalRow
+    );
     clearProductCache();
-    return { originalInvoiceId: originalRow.invoice_id, refundInvoice: refundRow };
+    return {
+      originalInvoiceId: originalRow.invoice_id,
+      refundInvoice: mapSalesInvoiceRowFromDb(refundRow)
+    };
   }
 };
 
@@ -3124,7 +3636,12 @@ export const customerService = {
       params.push(options.pagination.skip);
     }
 
-    return db.prepare(sql).all(...params);
+    const rows = db.prepare(sql).all(...params) as any[];
+    if (options?.select) {
+      return rows;
+    }
+
+    return rows.map(mapCustomerRowFromDb);
   },
 
   create: async (data: { name: string; email?: string; phone?: string; preferences?: string }) => {
@@ -3190,7 +3707,7 @@ export const customerService = {
     );
 
     enqueueOutbox("customers", row.customer_id, "insert", row.version, row);
-    return row;
+    return mapCustomerRowFromDb(row);
   },
 
   update: async (
@@ -3257,7 +3774,7 @@ export const customerService = {
     );
 
     enqueueOutbox("customers", id, "update", row.version, row);
-    return row;
+    return mapCustomerRowFromDb(row);
   },
 
   delete: async (id: string) => {
@@ -3288,21 +3805,23 @@ export const customerService = {
       last_modified_by_device_id: deviceId
     };
     enqueueOutbox("customers", id, "delete", version, payload);
-    return payload;
+    return mapCustomerRowFromDb(payload);
   },
 
   findByEmail: async (email: string) => {
     const db = getLocalDb();
-    return db
+    const row = db
       .prepare("SELECT * FROM customers WHERE email = ? AND deleted_at IS NULL")
       .get(email);
+    return mapCustomerRowFromDb(row);
   },
 
   findByPhone: async (phone: string) => {
     const db = getLocalDb();
-    return db
+    const row = db
       .prepare("SELECT * FROM customers WHERE phone = ? AND deleted_at IS NULL")
       .get(phone);
+    return mapCustomerRowFromDb(row);
   }
 };
 
@@ -3333,11 +3852,21 @@ export const inventoryService = {
         rows = rows.filter((row) => {
           const product = productMap.get(row.product_id);
           return (
-            String(row.batch_number ?? "").toLowerCase().includes(term) ||
-            String(product?.name ?? "").toLowerCase().includes(term) ||
-            String(product?.english_name ?? "").toLowerCase().includes(term) ||
-            String(product?.sku ?? "").toLowerCase().includes(term) ||
-            String(product?.barcode ?? "").toLowerCase().includes(term)
+            String(row.batch_number ?? "")
+              .toLowerCase()
+              .includes(term) ||
+            String(product?.name ?? "")
+              .toLowerCase()
+              .includes(term) ||
+            String(product?.english_name ?? "")
+              .toLowerCase()
+              .includes(term) ||
+            String(product?.sku ?? "")
+              .toLowerCase()
+              .includes(term) ||
+            String(product?.barcode ?? "")
+              .toLowerCase()
+              .includes(term)
           );
         });
       }
@@ -3373,15 +3902,8 @@ export const inventoryService = {
 
     return rows.map((row) => {
       const product = productMap.get(row.product_id);
-      return {
-        ...row,
-        product: product
-          ? {
-              ...product,
-              category: product.category_id ? categoryMap.get(product.category_id) ?? null : null
-            }
-          : null
-      };
+      const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+      return mapInventoryRowFromDb(row, { product, category });
     });
   },
   count: async (filters?: InventoryFilters) => {
@@ -3472,13 +3994,7 @@ export const inventoryService = {
           .get(product.category_id)
       : null;
 
-    return {
-      ...row,
-      product: {
-        ...product,
-        category
-      }
-    };
+    return mapInventoryRowFromDb(row, { product, category });
   },
 
   // Upsert method: create if doesn't exist, update if exists
@@ -3593,13 +4109,7 @@ export const inventoryService = {
           .get(product.category_id)
       : null;
 
-    return {
-      ...row,
-      product: {
-        ...product,
-        category
-      }
-    };
+    return mapInventoryRowFromDb(row, { product, category });
   },
 
   update: async (
@@ -3666,15 +4176,7 @@ export const inventoryService = {
           .get(product.category_id)
       : null;
 
-    return {
-      ...row,
-      product: product
-        ? {
-            ...product,
-            category
-          }
-        : null
-    };
+    return mapInventoryRowFromDb(row, { product, category });
   },
 
   delete: async (id: string) => {
@@ -3726,15 +4228,7 @@ export const inventoryService = {
           .get(product.category_id)
       : null;
 
-    return {
-      ...row,
-      product: product
-        ? {
-            ...product,
-            category
-          }
-        : null
-    };
+    return mapInventoryRowFromDb(row, { product, category });
   },
 
   // Quick adjust method for updating stock with reason tracking
@@ -3834,20 +4328,12 @@ export const inventoryService = {
           .get(product.category_id)
       : null;
 
-    return {
-      ...row,
-      product: product
-        ? {
-            ...product,
-            category
-          }
-        : null
-    };
+    return mapInventoryRowFromDb(row, { product, category });
   },
 
   getLowStockItems: async () => {
     const rows = await inventoryService.findMany();
-    return rows.filter((item: any) => Number(item.quantity) <= Number(item.reorder_level));
+    return rows.filter((item: any) => Number(item.quantity) <= Number(item.reorderLevel));
   },
 
   adjustStock: async (
@@ -3949,15 +4435,7 @@ export const inventoryService = {
           .get(product.category_id)
       : null;
 
-    return {
-      ...row,
-      product: product
-        ? {
-            ...product,
-            category
-          }
-        : null
-    };
+    return mapInventoryRowFromDb(row, { product, category });
   }
 };
 
@@ -3969,10 +4447,7 @@ export const stockSyncService = {
       .prepare("SELECT quantity FROM inventory WHERE product_id = ? AND deleted_at IS NULL")
       .all(productId) as { quantity: number }[];
 
-    const newStockLevel = rows.reduce(
-      (sum, row) => sum + Number(row.quantity ?? 0),
-      0
-    );
+    const newStockLevel = rows.reduce((sum, row) => sum + Number(row.quantity ?? 0), 0);
 
     updateLocalProductStockLevel(productId, newStockLevel);
     clearProductCache();
@@ -4024,7 +4499,11 @@ export const stockTransactionService = {
 
     if (filters?.reason) {
       const reason = filters.reason.toLowerCase();
-      rows = rows.filter((row) => String(row.reason ?? "").toLowerCase().includes(reason));
+      rows = rows.filter((row) =>
+        String(row.reason ?? "")
+          .toLowerCase()
+          .includes(reason)
+      );
     }
 
     if (filters?.dateFrom || filters?.dateTo) {
@@ -4053,10 +4532,18 @@ export const stockTransactionService = {
         rows = rows.filter((row) => {
           const product = productMap.get(row.product_id);
           return (
-            String(row.reason ?? "").toLowerCase().includes(term) ||
-            String(product?.name ?? "").toLowerCase().includes(term) ||
-            String(product?.english_name ?? "").toLowerCase().includes(term) ||
-            String(product?.sku ?? "").toLowerCase().includes(term)
+            String(row.reason ?? "")
+              .toLowerCase()
+              .includes(term) ||
+            String(product?.name ?? "")
+              .toLowerCase()
+              .includes(term) ||
+            String(product?.english_name ?? "")
+              .toLowerCase()
+              .includes(term) ||
+            String(product?.sku ?? "")
+              .toLowerCase()
+              .includes(term)
           );
         });
       }
@@ -4077,15 +4564,8 @@ export const stockTransactionService = {
 
     return rows.map((row) => {
       const product = productMap.get(row.product_id);
-      return {
-        ...row,
-        product: product
-          ? {
-              ...product,
-              category: product.category_id ? categoryMap.get(product.category_id) ?? null : null
-            }
-          : null
-      };
+      const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+      return mapStockTransactionRowFromDb(row, { product, category });
     });
   },
   count: async (filters?: StockTransactionFilters) => {
@@ -4161,8 +4641,14 @@ export const stockTransactionService = {
         inventoryRow.deleted_at,
         inventoryRow.last_modified_by_device_id
       );
-      enqueueOutbox("inventory", inventoryRow.inventory_id, "insert", inventoryRow.version, inventoryRow);
-      inventory = inventoryRow
+      enqueueOutbox(
+        "inventory",
+        inventoryRow.inventory_id,
+        "insert",
+        inventoryRow.version,
+        inventoryRow
+      );
+      inventory = inventoryRow;
     } else {
       const newQuantity = Math.max(0, Number(inventory.quantity) + formattedChangeQty);
       if (newQuantity < 0 && formattedChangeQty < 0) {
@@ -4192,8 +4678,14 @@ export const stockTransactionService = {
         updatedInventory.last_modified_by_device_id,
         updatedInventory.inventory_id
       );
-      enqueueOutbox("inventory", inventory.inventory_id, "update", updatedInventory.version, updatedInventory);
-      inventory = updatedInventory
+      enqueueOutbox(
+        "inventory",
+        inventory.inventory_id,
+        "update",
+        updatedInventory.version,
+        updatedInventory
+      );
+      inventory = updatedInventory;
     }
 
     const timestamp = nowIso();
@@ -4245,14 +4737,17 @@ export const stockTransactionService = {
       transactionRow.last_modified_by_device_id
     );
 
-    enqueueOutbox("stock_transactions", transactionRow.transaction_id, "insert", transactionRow.version, transactionRow);
+    enqueueOutbox(
+      "stock_transactions",
+      transactionRow.transaction_id,
+      "insert",
+      transactionRow.version,
+      transactionRow
+    );
     updateLocalProductStockLevel(data.productId, Number(inventory.quantity));
     clearProductCache();
 
-    return {
-      ...transactionRow,
-      product
-    };
+    return mapStockTransactionRowFromDb(transactionRow, { product });
   },
 
   update: async (
@@ -4309,7 +4804,13 @@ export const stockTransactionService = {
           updatedInventory.last_modified_by_device_id,
           updatedInventory.inventory_id
         );
-        enqueueOutbox("inventory", updatedInventory.inventory_id, "update", updatedInventory.version, updatedInventory);
+        enqueueOutbox(
+          "inventory",
+          updatedInventory.inventory_id,
+          "update",
+          updatedInventory.version,
+          updatedInventory
+        );
         updateLocalProductStockLevel(existing.product_id, updatedInventory.quantity);
       }
     }
@@ -4345,7 +4846,7 @@ export const stockTransactionService = {
 
     enqueueOutbox("stock_transactions", id, "update", row.version, row);
     clearProductCache();
-    return row;
+    return mapStockTransactionRowFromDb(row);
   },
 
   delete: async (id: string) => {
@@ -4384,7 +4885,13 @@ export const stockTransactionService = {
         updatedInventory.last_modified_by_device_id,
         updatedInventory.inventory_id
       );
-      enqueueOutbox("inventory", updatedInventory.inventory_id, "update", updatedInventory.version, updatedInventory);
+      enqueueOutbox(
+        "inventory",
+        updatedInventory.inventory_id,
+        "update",
+        updatedInventory.version,
+        updatedInventory
+      );
       updateLocalProductStockLevel(existing.product_id, updatedInventory.quantity);
     }
 
@@ -4408,7 +4915,7 @@ export const stockTransactionService = {
 
     enqueueOutbox("stock_transactions", id, "delete", row.version, row);
     clearProductCache();
-    return row;
+    return mapStockTransactionRowFromDb(row);
   },
 
   getStockMovementAnalytics: async (filters?: {
@@ -4425,15 +4932,15 @@ export const stockTransactionService = {
     const analytics = {
       totalTransactions: rows.length,
       totalStockIn: rows
-        .filter((t: any) => Number(t.change_qty) > 0)
-        .reduce((sum: number, t: any) => sum + Number(t.change_qty), 0),
+        .filter((t: any) => Number(t.changeQty) > 0)
+        .reduce((sum: number, t: any) => sum + Number(t.changeQty), 0),
       totalStockOut: rows
-        .filter((t: any) => Number(t.change_qty) < 0)
-        .reduce((sum: number, t: any) => sum + Math.abs(Number(t.change_qty)), 0),
-      netChange: rows.reduce((sum: number, t: any) => sum + Number(t.change_qty), 0),
+        .filter((t: any) => Number(t.changeQty) < 0)
+        .reduce((sum: number, t: any) => sum + Math.abs(Number(t.changeQty)), 0),
+      netChange: rows.reduce((sum: number, t: any) => sum + Number(t.changeQty), 0),
       reasonBreakdown: rows.reduce((acc: Record<string, number>, t: any) => {
         const key = t.reason ?? "unknown";
-        acc[key] = (acc[key] || 0) + Math.abs(Number(t.change_qty));
+        acc[key] = (acc[key] || 0) + Math.abs(Number(t.changeQty));
         return acc;
       }, {}),
       typeBreakdown: rows.reduce(
@@ -4443,7 +4950,7 @@ export const stockTransactionService = {
             acc[key] = { count: 0, totalQuantity: 0 };
           }
           acc[key].count += 1;
-          acc[key].totalQuantity += Math.abs(Number(t.change_qty));
+          acc[key].totalQuantity += Math.abs(Number(t.changeQty));
           return acc;
         },
         {}
@@ -4471,15 +4978,7 @@ export const stockTransactionService = {
           .get(product.category_id)
       : null;
 
-    return {
-      ...row,
-      product: product
-        ? {
-            ...product,
-            category
-          }
-        : null
-    };
+    return mapStockTransactionRowFromDb(row, { product, category });
   }
 };
 
@@ -4510,10 +5009,11 @@ export const supplierService = {
       poMap.set(po.supplier_id, list);
     }
 
-    return suppliers.map((supplier) => ({
-      ...supplier,
-      purchaseOrders: poMap.get(supplier.supplier_id) ?? []
-    }));
+    return suppliers.map((supplier) =>
+      mapSupplierRowFromDb(supplier, {
+        purchaseOrders: poMap.get(supplier.supplier_id) ?? []
+      })
+    );
   },
 
   create: async (data: {
@@ -4581,10 +5081,7 @@ export const supplierService = {
     );
 
     enqueueOutbox("suppliers", row.supplier_id, "insert", row.version, row);
-    return {
-      ...row,
-      purchaseOrders: []
-    };
+    return mapSupplierRowFromDb(row, { purchaseOrders: [] });
   },
 
   update: async (
@@ -4608,7 +5105,9 @@ export const supplierService = {
 
     if (data.name) {
       const duplicate = db
-        .prepare("SELECT supplier_id FROM suppliers WHERE name = ? AND supplier_id != ? AND deleted_at IS NULL")
+        .prepare(
+          "SELECT supplier_id FROM suppliers WHERE name = ? AND supplier_id != ? AND deleted_at IS NULL"
+        )
         .get(data.name, id);
       if (duplicate) {
         throw new Error(`Supplier with name "${data.name}" already exists`);
@@ -4655,10 +5154,7 @@ export const supplierService = {
       .prepare("SELECT * FROM purchase_orders WHERE supplier_id = ? AND deleted_at IS NULL")
       .all(id);
 
-    return {
-      ...row,
-      purchaseOrders
-    };
+    return mapSupplierRowFromDb(row, { purchaseOrders });
   },
 
   delete: async (id: string) => {
@@ -4691,7 +5187,7 @@ export const supplierService = {
     ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
 
     enqueueOutbox("suppliers", id, "delete", row.version, row);
-    return row;
+    return mapSupplierRowFromDb(row);
   },
 
   findById: async (id: string) => {
@@ -4728,8 +5224,7 @@ export const supplierService = {
     const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
     const productMap = new Map(products.map((product) => [product.product_id, product]));
 
-    return {
-      ...supplier,
+    return mapSupplierRowFromDb(supplier, {
       purchaseOrders: purchaseOrders.map((po) => ({
         ...po,
         items: (itemMap.get(po.po_id) ?? []).map((item) => ({
@@ -4737,7 +5232,7 @@ export const supplierService = {
           product: productMap.get(item.product_id) ?? null
         }))
       }))
-    };
+    });
   }
 };
 
@@ -4788,19 +5283,18 @@ export const purchaseOrderService = {
     const productMap = new Map(products.map((product) => [product.product_id, product]));
     const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
 
-    return rows.map((row) => ({
-      ...row,
-      supplier: supplierMap.get(row.supplier_id) ?? null,
-      items: (itemMap.get(row.po_id) ?? []).map((item) => ({
-        ...item,
-        product: item.product_id
-          ? {
-              ...productMap.get(item.product_id),
-              category: categoryMap.get(productMap.get(item.product_id)?.category_id) ?? null
-            }
-          : null
-      }))
-    }));
+    return rows.map((row) => {
+      const supplier = supplierMap.get(row.supplier_id) ?? null;
+      const items = (itemMap.get(row.po_id) ?? []).map((item) => {
+        const product = item.product_id ? productMap.get(item.product_id) : null;
+        const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+        return mapPurchaseOrderItemRowFromDb(item, { product, category });
+      });
+      return mapPurchaseOrderRowFromDb(row, {
+        supplier,
+        items
+      });
+    });
   },
 
   create: async (data: {
@@ -4919,11 +5413,10 @@ export const purchaseOrderService = {
       items.push(itemRow);
     }
 
-    return {
-      ...poRow,
+    return mapPurchaseOrderRowFromDb(poRow, {
       supplier,
-      items
-    };
+      items: items.map((item) => mapPurchaseOrderItemRowFromDb(item))
+    });
   },
 
   update: async (
@@ -4982,19 +5475,14 @@ export const purchaseOrderService = {
     const productMap = new Map(products.map((product) => [product.product_id, product]));
     const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
 
-    return {
-      ...row,
+    return mapPurchaseOrderRowFromDb(row, {
       supplier,
-      items: items.map((item) => ({
-        ...item,
-        product: item.product_id
-          ? {
-              ...productMap.get(item.product_id),
-              category: categoryMap.get(productMap.get(item.product_id)?.category_id) ?? null
-            }
-          : null
-      }))
-    };
+      items: items.map((item) => {
+        const product = item.product_id ? productMap.get(item.product_id) : null;
+        const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+        return mapPurchaseOrderItemRowFromDb(item, { product, category });
+      })
+    });
   },
 
   delete: async (id: string) => {
@@ -5046,11 +5534,17 @@ export const purchaseOrderService = {
           SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
           WHERE po_item_id = ?
         `
-      ).run(itemRow.deleted_at, itemRow.version, itemRow.updated_at, itemRow.last_modified_by_device_id, itemRow.po_item_id);
+      ).run(
+        itemRow.deleted_at,
+        itemRow.version,
+        itemRow.updated_at,
+        itemRow.last_modified_by_device_id,
+        itemRow.po_item_id
+      );
       enqueueOutbox("purchase_order_items", itemRow.po_item_id, "delete", itemRow.version, itemRow);
     }
 
-    return row;
+    return mapPurchaseOrderRowFromDb(row);
   },
 
   findById: async (id: string) => {
@@ -5075,19 +5569,14 @@ export const purchaseOrderService = {
     const productMap = new Map(products.map((product) => [product.product_id, product]));
     const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
 
-    return {
-      ...po,
+    return mapPurchaseOrderRowFromDb(po, {
       supplier,
-      items: items.map((item) => ({
-        ...item,
-        product: item.product_id
-          ? {
-              ...productMap.get(item.product_id),
-              category: categoryMap.get(productMap.get(item.product_id)?.category_id) ?? null
-            }
-          : null
-      }))
-    };
+      items: items.map((item) => {
+        const product = item.product_id ? productMap.get(item.product_id) : null;
+        const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+        return mapPurchaseOrderItemRowFromDb(item, { product, category });
+      })
+    });
   },
 
   receiveItems: async (
@@ -5121,7 +5610,13 @@ export const purchaseOrderService = {
           SET received_date = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
           WHERE po_item_id = ?
         `
-      ).run(row.received_date, row.version, row.updated_at, row.last_modified_by_device_id, row.po_item_id);
+      ).run(
+        row.received_date,
+        row.version,
+        row.updated_at,
+        row.last_modified_by_device_id,
+        row.po_item_id
+      );
 
       enqueueOutbox("purchase_order_items", row.po_item_id, "update", row.version, row);
     }
@@ -5236,8 +5731,8 @@ export const paymentService = {
         invoice: invoice
           ? {
               ...invoice,
-              customer: invoice.customer_id ? customerMap.get(invoice.customer_id) ?? null : null,
-              employee: invoice.employee_id ? employeeMap.get(invoice.employee_id) ?? null : null
+              customer: invoice.customer_id ? (customerMap.get(invoice.customer_id) ?? null) : null,
+              employee: invoice.employee_id ? (employeeMap.get(invoice.employee_id) ?? null) : null
             }
           : null
       };
@@ -5345,16 +5840,20 @@ export const paymentService = {
       invoiceRow.invoice_id
     );
 
-    enqueueOutbox("sales_invoices", invoiceRow.invoice_id, "update", invoiceRow.version, invoiceRow);
+    enqueueOutbox(
+      "sales_invoices",
+      invoiceRow.invoice_id,
+      "update",
+      invoiceRow.version,
+      invoiceRow
+    );
 
     return row;
   },
 
   findById: async (id: string) => {
     const db = getLocalDb();
-    return db
-      .prepare("SELECT * FROM payments WHERE payment_id = ? AND deleted_at IS NULL")
-      .get(id);
+    return db.prepare("SELECT * FROM payments WHERE payment_id = ? AND deleted_at IS NULL").get(id);
   },
 
   update: async (
@@ -5446,9 +5945,7 @@ export const settingsService = {
 
   findByKey: async (key: string) => {
     const db = getLocalDb();
-    const row = db
-      .prepare("SELECT * FROM settings WHERE key = ? AND deleted_at IS NULL")
-      .get(key);
+    const row = db.prepare("SELECT * FROM settings WHERE key = ? AND deleted_at IS NULL").get(key);
     if (!row) {
       return null;
     }
@@ -5806,7 +6303,7 @@ export const roleService = {
     }
 
     return roles.map((role) => ({
-      ...role,
+      ...mapRoleRowFromDb(role),
       rolePermissions: permissionMap.get(role.role_id) ?? [],
       employeeRoles: employeeMap.get(role.role_id) ?? []
     }));
@@ -5865,7 +6362,7 @@ export const roleService = {
 
     enqueueOutbox("roles", row.role_id, "insert", row.version, row);
     return {
-      ...row,
+      ...mapRoleRowFromDb(row),
       rolePermissions: []
     };
   },
@@ -5927,7 +6424,7 @@ export const roleService = {
 
     enqueueOutbox("roles", id, "update", row.version, row);
     return {
-      ...row,
+      ...mapRoleRowFromDb(row),
       rolePermissions: []
     };
   },
@@ -6010,14 +6507,12 @@ export const roleService = {
       );
     }
 
-    return row;
+    return mapRoleRowFromDb(row);
   },
 
   findById: async (id: string) => {
     const db = getLocalDb();
-    const role = db
-      .prepare("SELECT * FROM roles WHERE role_id = ? AND deleted_at IS NULL")
-      .get(id);
+    const role = db.prepare("SELECT * FROM roles WHERE role_id = ? AND deleted_at IS NULL").get(id);
     if (!role) {
       return null;
     }
@@ -6045,7 +6540,7 @@ export const roleService = {
       .all(id);
 
     return {
-      ...role,
+      ...mapRoleRowFromDb(role),
       rolePermissions: rolePermissions.map((row: any) => ({
         permission: {
           id: row.permission_id,
@@ -6136,7 +6631,12 @@ export const roleService = {
 
     return {
       role: role
-        ? { id: role.role_id, name: role.name, description: role.description, isSystem: Boolean(role.is_system) }
+        ? {
+            id: role.role_id,
+            name: role.name,
+            description: role.description,
+            isSystem: Boolean(role.is_system)
+          }
         : null,
       employee: employee ? { id: employee.id, name: employee.name, email: employee.email } : null
     };
@@ -6194,7 +6694,9 @@ export const roleService = {
   checkUsage: async (roleId: string) => {
     const db = getLocalDb();
     const countRow = db
-      .prepare("SELECT COUNT(1) AS count FROM employee_roles WHERE role_id = ? AND deleted_at IS NULL")
+      .prepare(
+        "SELECT COUNT(1) AS count FROM employee_roles WHERE role_id = ? AND deleted_at IS NULL"
+      )
       .get(roleId);
 
     return { count: Number(countRow?.count ?? 0) };
@@ -6204,9 +6706,10 @@ export const roleService = {
 export const permissionService = {
   findMany: async () => {
     const db = getLocalDb();
-    return db
+    const rows = db
       .prepare("SELECT * FROM permissions WHERE deleted_at IS NULL ORDER BY module, action, scope")
       .all();
+    return rows.map(mapPermissionRowFromDb);
   },
 
   create: async (data: {
@@ -6271,7 +6774,7 @@ export const permissionService = {
     );
 
     enqueueOutbox("permissions", row.permission_id, "insert", row.version, row);
-    return row;
+    return mapPermissionRowFromDb(row);
   },
 
   update: async (
@@ -6308,7 +6811,7 @@ export const permissionService = {
     ).run(row.description, row.version, row.updated_at, row.last_modified_by_device_id, id);
 
     enqueueOutbox("permissions", id, "update", row.version, row);
-    return row;
+    return mapPermissionRowFromDb(row);
   },
 
   delete: async (id: string) => {
@@ -6340,23 +6843,25 @@ export const permissionService = {
     ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, id);
 
     enqueueOutbox("permissions", id, "delete", row.version, row);
-    return row;
+    return mapPermissionRowFromDb(row);
   },
 
   findById: async (id: string) => {
     const db = getLocalDb();
-    return db
+    const row = db
       .prepare("SELECT * FROM permissions WHERE permission_id = ? AND deleted_at IS NULL")
       .get(id);
+    return mapPermissionRowFromDb(row);
   },
 
   findByModule: async (module: string) => {
     const db = getLocalDb();
-    return db
+    const rows = db
       .prepare(
         "SELECT * FROM permissions WHERE module = ? AND deleted_at IS NULL ORDER BY action ASC, scope ASC"
       )
       .all(module);
+    return rows.map(mapPermissionRowFromDb);
   },
 
   bulkCreate: async (
@@ -6394,10 +6899,16 @@ export const permissionService = {
             SET description = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
             WHERE permission_id = ?
           `
-        ).run(row.description, row.version, row.updated_at, row.last_modified_by_device_id, row.permission_id);
+        ).run(
+          row.description,
+          row.version,
+          row.updated_at,
+          row.last_modified_by_device_id,
+          row.permission_id
+        );
 
         enqueueOutbox("permissions", row.permission_id, "update", row.version, row);
-        results.push(row);
+        results.push(mapPermissionRowFromDb(row));
       } else {
         const permissionId = randomUUID();
         const deviceId = ensureDeviceId();
@@ -6444,7 +6955,7 @@ export const permissionService = {
         );
 
         enqueueOutbox("permissions", row.permission_id, "insert", row.version, row);
-        results.push(row);
+        results.push(mapPermissionRowFromDb(row));
       }
     }
 
@@ -6479,7 +6990,14 @@ export const rolePermissionService = {
           SET granted = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
           WHERE role_id = ? AND permission_id = ?
         `
-      ).run(row.granted, row.version, row.updated_at, row.last_modified_by_device_id, roleId, permissionId);
+      ).run(
+        row.granted,
+        row.version,
+        row.updated_at,
+        row.last_modified_by_device_id,
+        roleId,
+        permissionId
+      );
 
       enqueueOutbox(
         "role_permissions",
@@ -6567,7 +7085,14 @@ export const rolePermissionService = {
         SET granted = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
         WHERE role_id = ? AND permission_id = ?
       `
-    ).run(row.granted, row.version, row.updated_at, row.last_modified_by_device_id, roleId, permissionId);
+    ).run(
+      row.granted,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      roleId,
+      permissionId
+    );
 
     enqueueOutbox(
       "role_permissions",
@@ -6609,7 +7134,14 @@ export const rolePermissionService = {
         SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
         WHERE role_id = ? AND permission_id = ?
       `
-    ).run(row.deleted_at, row.version, row.updated_at, row.last_modified_by_device_id, roleId, permissionId);
+    ).run(
+      row.deleted_at,
+      row.version,
+      row.updated_at,
+      row.last_modified_by_device_id,
+      roleId,
+      permissionId
+    );
 
     enqueueOutbox(
       "role_permissions",
@@ -6624,7 +7156,7 @@ export const rolePermissionService = {
 
   getRolePermissions: async (roleId: string) => {
     const db = getLocalDb();
-    return db
+    const rows = db
       .prepare(
         `
           SELECT rp.role_id, rp.permission_id, rp.granted, p.module, p.action, p.scope, p.description
@@ -6633,7 +7165,20 @@ export const rolePermissionService = {
           WHERE rp.deleted_at IS NULL AND p.deleted_at IS NULL AND rp.role_id = ?
         `
       )
-      .all(roleId);
+      .all(roleId) as any[];
+
+    return rows.map((row) => ({
+      roleId: row.role_id,
+      permissionId: row.permission_id,
+      granted: Boolean(row.granted),
+      permission: mapPermissionRowFromDb({
+        permission_id: row.permission_id,
+        module: row.module,
+        action: row.action,
+        scope: row.scope,
+        description: row.description
+      })
+    }));
   },
 
   getEmployeePermissions: async (employeeId: string) => {
@@ -6655,13 +7200,23 @@ export const rolePermissionService = {
       .all(employeeId);
 
     const seen = new Set();
-    return rows.filter((row: any) => {
+    const uniqueRows = rows.filter((row: any) => {
       if (seen.has(row.permission_id)) {
         return false;
       }
       seen.add(row.permission_id);
       return true;
     });
+
+    return uniqueRows.map((row: any) =>
+      mapPermissionRowFromDb({
+        permission_id: row.permission_id,
+        module: row.module,
+        action: row.action,
+        scope: row.scope,
+        description: row.description
+      })
+    );
   },
 
   checkEmployeePermission: async (
@@ -6837,7 +7392,11 @@ const ensureTenantTables = async (): Promise<void> => {
     const prisma = getPrismaClient();
     const result = (await prisma.$queryRawUnsafe(
       "SELECT to_regclass('public.tenants')::text AS tenants, to_regclass('public.tenant_users')::text AS tenant_users, to_regclass('public.subscriptions')::text AS subscriptions"
-    )) as { tenants?: string | null; tenant_users?: string | null; subscriptions?: string | null }[];
+    )) as {
+      tenants?: string | null;
+      tenant_users?: string | null;
+      subscriptions?: string | null;
+    }[];
 
     const status = result?.[0] ?? {};
     const hasTenants = Boolean(status.tenants);
@@ -6887,10 +7446,10 @@ const ensureTenantTables = async (): Promise<void> => {
       "CREATE INDEX IF NOT EXISTS idx_tenant_users_email ON public.tenant_users(email);"
     );
     await prisma.$executeRawUnsafe(
-      "CREATE INDEX IF NOT EXISTS idx_tenant_users_tenant_id ON public.tenant_users(\"tenantId\");"
+      'CREATE INDEX IF NOT EXISTS idx_tenant_users_tenant_id ON public.tenant_users("tenantId");'
     );
     await prisma.$executeRawUnsafe(
-      "CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant_id ON public.subscriptions(\"tenantId\");"
+      'CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant_id ON public.subscriptions("tenantId");'
     );
   })();
 

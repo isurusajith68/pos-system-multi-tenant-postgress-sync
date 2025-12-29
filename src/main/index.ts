@@ -22,13 +22,22 @@ import {
   permissionService,
   rolePermissionService,
   customProductService,
-  subscriptionService
+  subscriptionService,
+  credentialCacheService,
+  localMetaService
 } from "./lib/database";
 import { backupService } from "./lib/backup";
 import { printerService } from "./lib/printer";
 import { scannerService } from "./lib/scanner";
 import { licenseService } from "./lib/license";
-import { bootstrapLocalFromServer, ensureDeviceId, setTenantId, syncNow } from "./lib/sync";
+import {
+  bootstrapLocalFromServer,
+  ensureDeviceId,
+  pullChanges,
+  pushOutbox,
+  setTenantId,
+  syncNow
+} from "./lib/sync";
 import { getSyncStatus, startSyncWorker } from "./lib/sync-worker";
 // import { initializeDatabase } from "./lib/database-init"; // Disabled: Database initialization no longer needed
 import { getPrismaClient, setActiveSchema } from "./lib/prisma";
@@ -387,6 +396,60 @@ app.whenReady().then(async () => {
       return await employeeService.hashPassword(password);
     } catch (error) {
       console.error("Error hashing password:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("credentialCache:findByEmail", async (_, email) => {
+    try {
+      return await credentialCacheService.findByEmail(email);
+    } catch (error) {
+      console.error("Error finding credential cache entry:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("credentialCache:upsert", async (_, data) => {
+    try {
+      return await credentialCacheService.upsert(data);
+    } catch (error) {
+      console.error("Error upserting credential cache entry:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("credentialCache:recordFailedAttempt", async (_, email) => {
+    try {
+      return await credentialCacheService.recordFailedAttempt(email);
+    } catch (error) {
+      console.error("Error recording credential cache failure:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("credentialCache:resetFailedAttempts", async (_, email) => {
+    try {
+      return await credentialCacheService.resetFailedAttempts(email);
+    } catch (error) {
+      console.error("Error resetting credential cache failures:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("localMeta:get", async (_, key) => {
+    try {
+      return await localMetaService.get(key);
+    } catch (error) {
+      console.error("Error reading local meta:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("localMeta:set", async (_, key, value) => {
+    try {
+      return await localMetaService.set(key, value);
+    } catch (error) {
+      console.error("Error writing local meta:", error);
       throw error;
     }
   });
@@ -1812,6 +1875,14 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("sync:run", async () => {
     return await syncNow();
+  });
+
+  ipcMain.handle("sync:push", async () => {
+    return await pushOutbox();
+  });
+
+  ipcMain.handle("sync:pull", async () => {
+    return await pullChanges();
   });
 
   ipcMain.handle("sync:setTenant", async (_, tenantId: string) => {

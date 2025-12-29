@@ -282,7 +282,7 @@ export const AppDataProvider: React.FC<AppDataProviderProps> = ({ children }) =>
       }
       setLoadingKey("products", true);
       try {
-        const data = await window.api.products.findMany();
+        const data = await window.api.products.findMany({ bypassCache: true });
         setProducts(data);
         setLoadedKey("products", true);
       } catch (error) {

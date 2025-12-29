@@ -11,6 +11,7 @@ type SettingsSection =
   | "general"
   | "employees"
   | "system"
+  | "sync"
   | "backup"
   | "security"
   | "notifications"
@@ -557,6 +558,36 @@ const SettingsManagement: React.FC = () => {
     }
   }, [t]);
 
+  const handleSyncOut = useCallback(async () => {
+    try {
+      setLoading(true);
+      const result = await window.electron.ipcRenderer.invoke("sync:push");
+      toast.success(
+        t("Uploaded {count} changes", { count: result?.acked ?? 0 })
+      );
+    } catch (error) {
+      console.error("Error pushing sync:", error);
+      toast.error(t("Failed to sync out"));
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  const handleSyncIn = useCallback(async () => {
+    try {
+      setLoading(true);
+      const result = await window.electron.ipcRenderer.invoke("sync:pull");
+      toast.success(
+        t("Pulled {count} changes", { count: result?.applied ?? 0 })
+      );
+    } catch (error) {
+      console.error("Error pulling sync:", error);
+      toast.error(t("Failed to sync in"));
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
   const createRole = useCallback(
     async (name: string, description: string): Promise<void> => {
       try {
@@ -614,17 +645,18 @@ const SettingsManagement: React.FC = () => {
   );
 
   const sections = [
-    { key: "general", label: "General Settings", icon: "⚙️" },
-    { key: "employees", label: "Employee", icon: "👥" },
-    { key: "printer", label: "Printer", icon: "🖨️" },
-    { key: "scanner", label: "Scanner", icon: "📷" },
-    { key: "system", label: "System Preferences", icon: "🖥️" },
-    { key: "backup", label: "Backup", icon: "💾" },
-    { key: "security", label: "Security", icon: "🔒" },
-    { key: "notifications", label: "Notifications", icon: "🔔" },
-    { key: "updates", label: "Updates", icon: "🔄" },
-    { key: "help", label: "Help", icon: "❓" }
-  ];
+  { key: "general", label: "General Settings", icon: "G" },
+  { key: "employees", label: "Employee", icon: "E" },
+  { key: "printer", label: "Printer", icon: "P" },
+  { key: "scanner", label: "Scanner", icon: "S" },
+  { key: "system", label: "System Preferences", icon: "SYS" },
+  { key: "sync", label: "Sync", icon: "SYNC" },
+  { key: "backup", label: "Backup", icon: "B" },
+  { key: "security", label: "Security", icon: "SEC" },
+  { key: "notifications", label: "Notifications", icon: "N" },
+  { key: "updates", label: "Updates", icon: "U" },
+  { key: "help", label: "Help", icon: "H" }
+];
 
   const downloadPercent = Math.min(100, Math.max(0, updatePayload?.percent ?? 0));
   const releaseNotesText =
@@ -729,6 +761,41 @@ const SettingsManagement: React.FC = () => {
       description: "Alert when stock falls below this number",
       type: "input",
       value: settings.lowStockThreshold
+    }
+  ];
+
+  const syncSettings: SettingItem[] = [
+    {
+      id: "syncOut",
+      label: "Sync Out",
+      description: "Upload local changes to the server",
+      type: "button",
+      action: handleSyncOut
+    },
+    {
+      id: "syncIn",
+      label: "Sync In",
+      description: "Download server changes to this device",
+      type: "button",
+      action: handleSyncIn
+    },
+    {
+      id: "syncBootstrap",
+      label: "Bootstrap",
+      description: "Initial full download when local database is empty",
+      type: "button",
+      action: async () => {
+        try {
+          setLoading(true);
+          await window.electron.ipcRenderer.invoke("sync:bootstrap");
+          toast.success(t("Bootstrap completed"));
+        } catch (error) {
+          console.error("Error running bootstrap:", error);
+          toast.error(t("Bootstrap failed"));
+        } finally {
+          setLoading(false);
+        }
+      }
     }
   ];
 
@@ -1125,6 +1192,8 @@ const SettingsManagement: React.FC = () => {
         return scannerSettings;
       case "system":
         return systemSettings;
+      case "sync":
+        return syncSettings;
       case "backup":
         return backupSettings;
       case "security":
@@ -1576,6 +1645,7 @@ const SettingsManagement: React.FC = () => {
                 {activeSection === "scanner" &&
                   t("Configure barcode/QR code scanner settings and test functionality")}
                 {activeSection === "system" && t("Customize system behavior and appearance")}
+                {activeSection === "sync" && t("Push local changes or pull server updates")}
                 {activeSection === "backup" && t("Manage data backup and restore operations")}
                 {activeSection === "security" &&
                   t("Configure role-based permissions and security settings")}
@@ -1793,3 +1863,4 @@ const SettingsManagement: React.FC = () => {
 };
 
 export default SettingsManagement;
+

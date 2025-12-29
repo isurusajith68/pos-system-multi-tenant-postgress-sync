@@ -404,12 +404,16 @@ const SalesInvoices: React.FC = () => {
       fetchInvoices();
     }
   }, [fetchInvoices, permissionsLoaded, permissions]);
-
+  console.log(invoices, "invoices");
   const filteredInvoices = invoices.filter((invoice) => {
+    const searchLower = searchTerm.toLowerCase();
+    const invoiceId = String(invoice.id ?? "").toLowerCase();
+    const customerName = invoice.customer?.name ? invoice.customer.name.toLowerCase() : "";
+    const employeeName = invoice.employee?.name ? invoice.employee.name.toLowerCase() : "";
     const matchesSearch =
-      invoice.id.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      invoice.customer?.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      invoice.employee?.name.toLowerCase().includes(searchTerm.toLowerCase());
+      invoiceId.includes(searchLower) ||
+      customerName.includes(searchLower) ||
+      employeeName.includes(searchLower);
 
     const matchesEmployee = selectedEmployee === "all" || invoice.employeeId === selectedEmployee;
     const matchesPaymentMode =
@@ -1175,8 +1179,11 @@ Note: This report excludes ${invoices.length - validInvoices.length} invoices wi
                 className="w-full px-3 py-2 border border-gray-300 dark:border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
               >
                 <option value="all">{t("All Employees")}</option>
-                {employees.map((employee) => (
-                  <option key={employee.id} value={employee.id}>
+                {employees.map((employee, index) => (
+                  <option
+                    key={employee.id ?? employee.employee_id ?? `employee-${index}`}
+                    value={employee.id}
+                  >
                     {employee.name}
                   </option>
                 ))}
@@ -1223,8 +1230,8 @@ Note: This report excludes ${invoices.length - validInvoices.length} invoices wi
                 className="w-full px-3 py-2 border border-gray-300 dark:border-slate-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
               >
                 <option value="all">{t("All Customers")}</option>
-                {customers.map((customer) => (
-                  <option key={customer.id} value={customer.id}>
+                {customers.map((customer, index) => (
+                  <option key={customer.id ?? `customer-${index}`} value={customer.id}>
                     {customer.name}
                   </option>
                 ))}

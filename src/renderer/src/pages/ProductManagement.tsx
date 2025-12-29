@@ -252,7 +252,8 @@ const ProductManagement: React.FC = () => {
         window.api.products.findMany({
           filters: productFilters,
           pagination,
-          sort: { field: sortField, direction: sortDirection }
+          sort: { field: sortField, direction: sortDirection },
+          bypassCache: true
         }),
         window.api.products.count(productFilters)
       ]);

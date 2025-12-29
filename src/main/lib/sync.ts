@@ -169,6 +169,69 @@ const sanitizePayload = (tableName: string, payload: Record<string, any>): Recor
   return sanitized;
 };
 
+const tenantColumnCache = new Map<string, Set<string>>();
+
+const snakeToCamel = (value: string): string => {
+  return value.replace(/_([a-z])/g, (_, char: string) => char.toUpperCase());
+};
+
+const camelToSnake = (value: string): string => {
+  return value.replace(/[A-Z]/g, (char) => `_${char.toLowerCase()}`);
+};
+
+const getTenantTableColumns = async (
+  prisma: ReturnType<typeof getTenantPrismaClient>,
+  tableName: string
+): Promise<Set<string>> => {
+  const cached = tenantColumnCache.get(tableName);
+  if (cached) {
+    return cached;
+  }
+
+  const rows = (await prisma.$queryRawUnsafe(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = $1
+    `,
+    tableName
+  )) as { column_name: string }[];
+
+  const columns = new Set(rows.map((row) => row.column_name));
+  tenantColumnCache.set(tableName, columns);
+  return columns;
+};
+
+const mapPayloadToTenantColumns = async (
+  prisma: ReturnType<typeof getTenantPrismaClient>,
+  tableName: string,
+  payload: Record<string, any>
+): Promise<Record<string, any>> => {
+  const columns = await getTenantTableColumns(prisma, tableName);
+  const mapped: Record<string, any> = {};
+
+  for (const [key, value] of Object.entries(payload)) {
+    if (columns.has(key)) {
+      mapped[key] = value;
+      continue;
+    }
+
+    const camelKey = snakeToCamel(key);
+    if (columns.has(camelKey)) {
+      mapped[camelKey] = value;
+      continue;
+    }
+
+    const snakeKey = camelToSnake(key);
+    if (columns.has(snakeKey)) {
+      mapped[snakeKey] = value;
+    }
+  }
+
+  return mapped;
+};
+
 const normalizePayloadForPostgres = (payload: Record<string, any>): Record<string, any> => {
   const normalized: Record<string, any> = {};
 
@@ -178,7 +241,30 @@ const normalizePayloadForPostgres = (payload: Record<string, any>): Record<strin
       continue;
     }
 
-    if (key.endsWith("_at")) {
+    if (key === "granted") {
+      if (typeof value === "number") {
+        normalized[key] = value !== 0;
+        continue;
+      }
+      if (typeof value === "string") {
+        if (value === "0" || value === "1") {
+          normalized[key] = value === "1";
+          continue;
+        }
+        if (value.toLowerCase() === "true" || value.toLowerCase() === "false") {
+          normalized[key] = value.toLowerCase() === "true";
+          continue;
+        }
+      }
+    }
+
+    if (
+      key.endsWith("_at") ||
+      key.endsWith("_date") ||
+      key.endsWith("At") ||
+      key.endsWith("Date") ||
+      key === "date"
+    ) {
       if (value instanceof Date) {
         normalized[key] = value;
         continue;
@@ -324,7 +410,8 @@ const insertRow = async (
   tableName: string,
   payload: Record<string, any>
 ): Promise<void> => {
-  const normalizedPayload = normalizePayloadForPostgres(payload);
+  const mappedPayload = await mapPayloadToTenantColumns(prisma, tableName, payload);
+  const normalizedPayload = normalizePayloadForPostgres(mappedPayload);
   const columns = Object.keys(normalizedPayload);
   const values = columns.map((column) => normalizedPayload[column]);
   const columnSql = columns.map((column) => quoteIdentifier(column)).join(", ");
@@ -349,7 +436,8 @@ const updateRow = async (
   const primaryKeys = PRIMARY_KEYS[tableName];
   const parsedRowId = parseRowId(primaryKeys, rowId);
 
-  const normalizedPayload = normalizePayloadForPostgres(payload);
+  const mappedPayload = await mapPayloadToTenantColumns(prisma, tableName, payload);
+  const normalizedPayload = normalizePayloadForPostgres(mappedPayload);
   const columns = Object.keys(normalizedPayload);
   const values = columns.map((column) => normalizedPayload[column]);
   const setSql = columns.map((column, index) => `${quoteIdentifier(column)} = $${index + 1}`);
@@ -872,6 +960,8 @@ const localColumnCache = new Map<string, string[]>();
     return { sql, columns };
   };
 
+  db.prepare("PRAGMA foreign_keys = OFF").run();
+
   for (const tableName of tableNames) {
     ensureAllowedTable(tableName);
     db.prepare(`DELETE FROM ${tableName}`).run();
@@ -959,6 +1049,7 @@ const localColumnCache = new Map<string, string[]>();
   setLastChangeId(lastChangeId);
 
   markBootstrapComplete();
+  db.prepare("PRAGMA foreign_keys = ON").run();
 
   return {
     tables: tableNames.length,

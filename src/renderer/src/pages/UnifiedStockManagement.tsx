@@ -397,7 +397,7 @@ const UnifiedStockManagement: React.FC = () => {
   }, [transactionsTotalItems, transactionsItemsPerPage, transactionsPage]);
 
   const fetchProducts = useCallback(async (): Promise<void> => {
-    const data = await window.api.products.findMany();
+    const data = await window.api.products.findMany({ bypassCache: true });
     setProducts(data);
   }, []);
 
@@ -612,7 +612,8 @@ const UnifiedStockManagement: React.FC = () => {
       document.removeEventListener("focusout", handleFocusOut);
     };
   }, []);
-
+  console.log(inventory);
+  console.log(products)
   const inventoryTotalsByProduct = useMemo(() => {
     const totals = new Map<string, number>();
     inventory.forEach((item) => {
@@ -624,13 +625,16 @@ const UnifiedStockManagement: React.FC = () => {
 
   const calculateStockSync = useCallback(() => {
     return products.map((product) => {
-      const inventoryTotal = inventoryTotalsByProduct.get(product.id) ?? 0;
-      const isInSync = product.stockLevel === inventoryTotal;
+      const inventoryTotal = formatToThreeDecimalPlaces(
+        inventoryTotalsByProduct.get(product.id) ?? 0
+      );
+      const productStockLevel = formatToThreeDecimalPlaces(product.stockLevel);
+      const isInSync = Math.abs(productStockLevel - inventoryTotal) < 0.001;
 
       return {
         productId: product.id,
         productName: product.name,
-        productStockLevel: product.stockLevel,
+        productStockLevel,
         inventoryTotal,
         isInSync
       };

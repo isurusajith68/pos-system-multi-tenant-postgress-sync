@@ -7,6 +7,7 @@ interface Employee {
   name: string;
   role: string;
   email: string;
+  loginExpiresAt?: string;
   employeeRoles?: {
     role: {
       id: string;
@@ -52,8 +53,20 @@ interface CurrentUserProviderProps {
 export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<Employee | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const sessionTtlMs = 24 * 60 * 60 * 1000;
 
   const isAuthenticated = currentUser !== null;
+
+  const isNetworkError = (error: unknown): boolean => {
+    const message = String(error ?? "");
+    return (
+      message.includes("Can't reach database server") ||
+      message.includes("ECONNREFUSED") ||
+      message.includes("ENOTFOUND") ||
+      message.includes("network") ||
+      message.includes("NetworkError")
+    );
+  };
 
   const setActiveSchema = async (schemaName: string | null) => {
     await window.electron.ipcRenderer.invoke("tenants:setActiveSchema", schemaName);
@@ -63,19 +76,119 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
     await setActiveSchema(null);
   };
 
+  const attemptOfflineLogin = async (email: string, password: string): Promise<boolean> => {
+    const normalizedEmail = email.trim().toLowerCase();
+    const cached = await window.electron.ipcRenderer.invoke(
+      "credentialCache:findByEmail",
+      normalizedEmail
+    );
+    if (!cached) {
+      toast.error("Internet connection required for first login.");
+      return false;
+    }
+
+    const expiresAt = cached.expires_at ? new Date(cached.expires_at) : null;
+    if (!expiresAt || Number.isNaN(expiresAt.getTime()) || expiresAt <= new Date()) {
+      toast.error("Offline login expired. Please connect to the internet.");
+      return false;
+    }
+
+    const isValidPassword = await window.electron.ipcRenderer.invoke(
+      "employees:verifyPassword",
+      password,
+      cached.password_hash
+    );
+
+    if (!isValidPassword) {
+      await window.electron.ipcRenderer.invoke(
+        "credentialCache:recordFailedAttempt",
+        normalizedEmail
+      );
+      toast.error("Invalid email or password");
+      return false;
+    }
+
+    await window.electron.ipcRenderer.invoke(
+      "credentialCache:resetFailedAttempts",
+      normalizedEmail
+    );
+
+    const storedUserRaw =
+      localStorage.getItem("currentUser") ?? localStorage.getItem("lastUserProfile");
+    let storedUser = storedUserRaw ? JSON.parse(storedUserRaw) : null;
+
+    if (!storedUser) {
+      const lastEmail = await window.electron.ipcRenderer.invoke(
+        "localMeta:get",
+        "last_login_email"
+      );
+      const lastSchema = await window.electron.ipcRenderer.invoke(
+        "localMeta:get",
+        "last_login_schema"
+      );
+      const lastTenant = await window.electron.ipcRenderer.invoke(
+        "localMeta:get",
+        "last_login_tenant"
+      );
+      if (lastEmail && lastEmail !== normalizedEmail) {
+        toast.error("Offline login requires a previous online login.");
+        return false;
+      }
+
+      storedUser = {
+        email: normalizedEmail,
+        schemaName: lastSchema,
+        tenantId: lastTenant
+      };
+    }
+
+    if (
+      !storedUser?.schemaName ||
+      String(storedUser.email ?? "").trim().toLowerCase() !== normalizedEmail
+    ) {
+      toast.error("Offline login requires a previous online login.");
+      return false;
+    }
+
+    await setActiveSchema(storedUser.schemaName);
+    if (storedUser.tenantId) {
+      await window.electron.ipcRenderer.invoke("sync:setTenant", storedUser.tenantId);
+    }
+
+    const localEmployee = await window.electron.ipcRenderer.invoke(
+      "employees:findByEmail",
+      normalizedEmail,
+      storedUser.schemaName
+    );
+    if (!localEmployee && !storedUser?.id) {
+      toast.error("Offline login unavailable. Please connect to the internet.");
+      return false;
+    }
+
+    setCurrentUser({
+      ...storedUser,
+      ...(localEmployee ?? {}),
+      loginExpiresAt: cached.expires_at
+    });
+    return true;
+  };
+
   const login = async (email: string, password: string): Promise<boolean> => {
     setIsLoading(true);
     try {
-      // Multi-tenant login flow:
-      // 1. Check if email exists in public.tenant_users
-      // 2. Check subscription status in public.subscriptions
-      // 3. Get tenant schema from public.tenants
-      // 4. Connect to tenant schema and verify employee credentials
+      const normalizedEmail = email.trim().toLowerCase();
+      if (!navigator.onLine) {
+        return await attemptOfflineLogin(normalizedEmail, password);
+      }
+      console.log("try with internet");
       await clearActiveSchema();
 
       // Step 1: Find tenant user by email in public schema
-      const tenantUser = await window.electron.ipcRenderer.invoke("tenantUsers:findByEmail", email);
-      console.log(tenantUser)
+      const tenantUser = await window.electron.ipcRenderer.invoke(
+        "tenantUsers:findByEmail",
+        normalizedEmail
+      );
+      console.log(tenantUser);
       if (!tenantUser) {
         console.log("No tenant user found for email:", email);
         toast.error("Invalid email or password");
@@ -120,18 +233,11 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
       await setActiveSchema(schemaName);
       await window.electron.ipcRenderer.invoke("sync:setTenant", tenantUser.tenantId);
 
-      let employee = await window.electron.ipcRenderer.invoke(
-        "employees:findByEmail",
-        email,
+      const employee = await window.electron.ipcRenderer.invoke(
+        "employees:findByEmailOnline",
+        normalizedEmail,
         schemaName
       );
-      if (!employee) {
-        employee = await window.electron.ipcRenderer.invoke(
-          "employees:findByEmailOnline",
-          email,
-          schemaName
-        );
-      }
       if (!employee) {
         console.log("No employee found in tenant schema for email:", email);
         await clearActiveSchema();
@@ -155,11 +261,14 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
         );
         const employeeWithRoles = employees.find((emp: Employee) => emp.id === employee.id);
 
+        const nowIso = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + sessionTtlMs).toISOString();
         const userWithTenant = {
           ...(employeeWithRoles || employee),
           tenantId: tenantUser.tenantId,
           schemaName: schemaName,
           companyName: tenantUser.businessName,
+          loginExpiresAt: expiresAt,
           subscription: {
             planName: subscription.planName,
             joinedAt: subscription.joinedAt,
@@ -167,6 +276,22 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
             status: subscription.status
           }
         };
+
+        await window.electron.ipcRenderer.invoke("credentialCache:upsert", {
+          userId: employee.id,
+          email: normalizedEmail,
+          passwordHash: employee.password_hash,
+          roles: JSON.stringify(userWithTenant.employeeRoles ?? []),
+          lastVerifiedAt: nowIso,
+          expiresAt
+        });
+        await window.electron.ipcRenderer.invoke("localMeta:set", "last_login_email", normalizedEmail);
+        await window.electron.ipcRenderer.invoke("localMeta:set", "last_login_schema", schemaName);
+        await window.electron.ipcRenderer.invoke(
+          "localMeta:set",
+          "last_login_tenant",
+          tenantUser.tenantId
+        );
 
         setCurrentUser(userWithTenant);
         return true;
@@ -183,6 +308,12 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
       } catch (schemaError) {
         console.error("Failed to clear active schema after login error:", schemaError);
       }
+
+      if (isNetworkError(error)) {
+        const offlineSuccess = await attemptOfflineLogin(email.trim().toLowerCase(), password);
+        return offlineSuccess;
+      }
+
       return false;
     } finally {
       setIsLoading(false);
@@ -203,14 +334,42 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
         try {
           const user = JSON.parse(storedUser);
 
-          // Validate that the user still exists in the database
+          const expiresAt = user?.loginExpiresAt ? new Date(user.loginExpiresAt) : null;
+          if (!expiresAt || Number.isNaN(expiresAt.getTime()) || expiresAt <= new Date()) {
+            toast.error("Session expired. Please login again.");
+            localStorage.removeItem("currentUser");
+            setCurrentUser(null);
+            await clearActiveSchema();
+            return;
+          }
+
           try {
             let schemaName =
               typeof user.schemaName === "string" && user.schemaName.trim().length > 0
                 ? user.schemaName
                 : null;
+            let tenantId = user.tenantId ?? null;
 
             if (!schemaName) {
+              const lastSchema = await window.electron.ipcRenderer.invoke(
+                "localMeta:get",
+                "last_login_schema"
+              );
+              const lastTenant = await window.electron.ipcRenderer.invoke(
+                "localMeta:get",
+                "last_login_tenant"
+              );
+              const lastEmail = await window.electron.ipcRenderer.invoke(
+                "localMeta:get",
+                "last_login_email"
+              );
+              if (lastEmail && String(lastEmail).toLowerCase() === String(user.email).toLowerCase()) {
+                schemaName = lastSchema ?? null;
+                tenantId = lastTenant ?? tenantId;
+              }
+            }
+
+            if (!schemaName && navigator.onLine) {
               await clearActiveSchema();
               const tenantUser = await window.electron.ipcRenderer.invoke(
                 "tenantUsers:findByEmail",
@@ -218,32 +377,26 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
               );
               schemaName = tenantUser?.schemaName ?? null;
               if (tenantUser?.tenantId) {
-                await window.electron.ipcRenderer.invoke("sync:setTenant", tenantUser.tenantId);
+                tenantId = tenantUser.tenantId;
               }
             }
-            await setActiveSchema(schemaName);
-            if (user.tenantId) {
-              await window.electron.ipcRenderer.invoke("sync:setTenant", user.tenantId);
-            }
-            const employee = await window.electron.ipcRenderer.invoke(
-              "employees:findByEmail",
-              user.email,
-              schemaName
-            );
 
-            if (employee && employee.id === user.id) {
-              // User still exists, use the stored data
-              setCurrentUser(user);
-              console.log("CurrentUser: Loaded from localStorage:", user.email);
-            } else {
-              // User no longer exists or ID mismatch, clear localStorage
-              console.log("CurrentUser: Stored user no longer valid, clearing localStorage");
+            if (!schemaName) {
               localStorage.removeItem("currentUser");
               setCurrentUser(null);
               await clearActiveSchema();
+              return;
             }
+
+            await setActiveSchema(schemaName);
+            if (tenantId) {
+              await window.electron.ipcRenderer.invoke("sync:setTenant", tenantId);
+            }
+
+            setCurrentUser({ ...user, schemaName, tenantId });
+            console.log("CurrentUser: Loaded from localStorage:", user.email);
           } catch (error) {
-            console.error("Error validating stored user:", error);
+            console.error("Error restoring stored user:", error);
             localStorage.removeItem("currentUser");
             setCurrentUser(null);
             await clearActiveSchema();
@@ -256,14 +409,40 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
       }
     };
 
-    console.log("starting....")
+    console.log("starting....");
     loadStoredUser();
   }, []);
+
+  useEffect(() => {
+    if (!currentUser?.loginExpiresAt) {
+      return;
+    }
+
+    const expiresAt = new Date(currentUser.loginExpiresAt).getTime();
+    if (Number.isNaN(expiresAt)) {
+      return;
+    }
+
+    const remaining = expiresAt - Date.now();
+    if (remaining <= 0) {
+      toast.error("Session expired. Please login again.");
+      logout();
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      toast.error("Session expired. Please login again.");
+      logout();
+    }, remaining);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [currentUser]);
 
   // Save user to localStorage when currentUser changes
   useEffect(() => {
     if (currentUser) {
       localStorage.setItem("currentUser", JSON.stringify(currentUser));
+      localStorage.setItem("lastUserProfile", JSON.stringify(currentUser));
     } else {
       localStorage.removeItem("currentUser");
     }
