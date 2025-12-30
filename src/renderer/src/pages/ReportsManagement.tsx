@@ -1,4 +1,3 @@
-import { formatToThreeDecimalPlaces } from "@renderer/lib/quantityValidation";
 import React, { useState, useEffect, useMemo } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "../contexts/LanguageContext";

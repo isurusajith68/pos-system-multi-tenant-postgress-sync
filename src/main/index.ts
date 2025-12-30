@@ -41,7 +41,7 @@ import {
 import { getSyncStatus, startSyncWorker } from "./lib/sync-worker";
 // import { initializeDatabase } from "./lib/database-init"; // Disabled: Database initialization no longer needed
 import { getPrismaClient, setActiveSchema } from "./lib/prisma";
-import { initializeDatabase } from "./lib/database-init";
+// import { initializeDatabase } from "./lib/database-init";
 
 // Configure logging
 log.transports.file.level = "info";

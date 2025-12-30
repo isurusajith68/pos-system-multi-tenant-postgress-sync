@@ -440,6 +440,16 @@ type SettingsCacheEntry = {
   expiresAt: number;
 };
 
+type SettingsRow = {
+  key: string;
+  value: string;
+  type: string;
+  category: string;
+  description?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 let settingsCache: SettingsCacheEntry | null = null;
 
 const clearSettingsCache = (): void => {
@@ -1083,9 +1093,12 @@ export const productService = {
     price: number;
     costPrice?: number;
     discountedPrice?: number;
+    wholesale?: number;
     taxInclusivePrice?: number;
     taxRate?: number;
     unitSize?: string;
+    unitType?: string;
+    unit?: string;
     stockLevel?: number;
   }) => {
     const db = getLocalDb();
@@ -1203,9 +1216,12 @@ export const productService = {
       price?: number;
       costPrice?: number;
       discountedPrice?: number;
+      wholesale?: number;
       taxInclusivePrice?: number;
       taxRate?: number;
       unitSize?: string;
+      unitType?: string;
+      unit?: string;
       stockLevel?: number;
     }
   ) => {
@@ -1843,6 +1859,7 @@ export const employeeService = {
       name?: string;
       role?: string;
       email?: string;
+      address?: string;
       password_hash?: string;
     }
   ) => {
@@ -1939,7 +1956,7 @@ export const employeeService = {
       email?: string;
       address?: string;
       password_hash?: string;
-      roleId?: string;
+      roleId?: string | null;
       tenantId?: string;
       previousEmail?: string;
     }
@@ -2434,21 +2451,23 @@ export const salesInvoiceService = {
     const customerIds = rows.map((row) => row.customer_id).filter(Boolean);
     const employeeIds = rows.map((row) => row.employee_id).filter(Boolean);
     const customers = customerIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT * FROM customers WHERE customer_id IN (${customerIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...customerIds)
-      : [];
+          .all(...customerIds) as any[])
+      : ([] as any[]);
     const employees = employeeIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT * FROM employee WHERE id IN (${employeeIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...employeeIds)
-      : [];
-    const customerMap = new Map(customers.map((row) => [row.customer_id, row]));
-    const employeeMap = new Map(employees.map((row) => [row.id, row]));
+          .all(...employeeIds) as any[])
+      : ([] as any[]);
+    const customerMap = new Map<string, any>(
+      customers.map((row: any) => [row.customer_id, row])
+    );
+    const employeeMap = new Map<string, any>(employees.map((row: any) => [row.id, row]));
 
     const invoiceIds = rows.map((row) => row.invoice_id);
     const payments = invoiceIds.length
@@ -2481,25 +2500,29 @@ export const salesInvoiceService = {
 
     const productIds = salesDetails.map((row) => row.product_id).filter(Boolean);
     const products = productIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT * FROM products WHERE product_id IN (${productIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...productIds)
-      : [];
-    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
-    const productMap = new Map(products.map((row) => [row.product_id, row]));
-    const categoryMap = new Map(categories.map((row) => [row.category_id, row]));
+          .all(...productIds) as any[])
+      : ([] as any[]);
+    const categories = db
+      .prepare("SELECT * FROM categories WHERE deleted_at IS NULL")
+      .all() as any[];
+    const productMap = new Map<string, any>(products.map((row: any) => [row.product_id, row]));
+    const categoryMap = new Map<string, any>(categories.map((row: any) => [row.category_id, row]));
 
     const customProductIds = salesDetails.map((row) => row.custom_product_id).filter(Boolean);
     const customProducts = customProductIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT * FROM custom_products WHERE custom_product_id IN (${customProductIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...customProductIds)
-      : [];
-    const customProductMap = new Map(customProducts.map((row) => [row.custom_product_id, row]));
+          .all(...customProductIds) as any[])
+      : ([] as any[]);
+    const customProductMap = new Map<string, any>(
+      customProducts.map((row: any) => [row.custom_product_id, row])
+    );
 
     return rows.map((invoice) => {
       const paymentsForInvoice = paymentMap.get(invoice.invoice_id) ?? [];
@@ -2513,7 +2536,13 @@ export const salesInvoiceService = {
         paymentStatus = totalPaid > 0 ? "partial" : "unpaid";
       }
 
-      return mapSalesInvoiceRowFromDb(invoice, {
+      const invoiceRow = {
+        ...invoice,
+        outstanding_balance: outstandingBalance,
+        payment_status: paymentStatus
+      };
+
+      return mapSalesInvoiceRowFromDb(invoiceRow, {
         customer: invoice.customer_id
           ? mapCustomerRowFromDb(customerMap.get(invoice.customer_id))
           : null,
@@ -2547,9 +2576,7 @@ export const salesInvoiceService = {
               ? (customProductMap.get(detail.custom_product_id) ?? null)
               : null
           })
-        ),
-        outstandingBalance,
-        paymentStatus
+        )
       });
     });
   },
@@ -2710,13 +2737,13 @@ export const salesInvoiceService = {
     );
 
     const productRows = productIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT * FROM products WHERE product_id IN (${productIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...productIds)
-      : [];
-    const productMap = new Map(productRows.map((row) => [row.product_id, row]));
+          .all(...productIds) as any[])
+      : ([] as any[]);
+    const productMap = new Map<string, any>(productRows.map((row: any) => [row.product_id, row]));
 
     for (const detail of data.salesDetails) {
       const detailId = randomUUID();
@@ -3851,10 +3878,16 @@ export const inventoryService = {
       rows = rows.filter((row) => row.product_id === filters.productId);
     }
 
-    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
-    const productMap = new Map(products.map((product: any) => [product.product_id, product]));
-    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
-    const categoryMap = new Map(categories.map((cat: any) => [cat.category_id, cat]));
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all() as any[];
+    const productMap = new Map<string, any>(
+      products.map((product: any) => [product.product_id, product])
+    );
+    const categories = db
+      .prepare("SELECT * FROM categories WHERE deleted_at IS NULL")
+      .all() as any[];
+    const categoryMap = new Map<string, any>(
+      categories.map((cat: any) => [cat.category_id, cat])
+    );
 
     if (filters?.searchTerm) {
       const term = filters.searchTerm.trim().toLowerCase();
@@ -4531,10 +4564,16 @@ export const stockTransactionService = {
       });
     }
 
-    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
-    const productMap = new Map(products.map((product: any) => [product.product_id, product]));
-    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
-    const categoryMap = new Map(categories.map((cat: any) => [cat.category_id, cat]));
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all() as any[];
+    const productMap = new Map<string, any>(
+      products.map((product: any) => [product.product_id, product])
+    );
+    const categories = db
+      .prepare("SELECT * FROM categories WHERE deleted_at IS NULL")
+      .all() as any[];
+    const categoryMap = new Map<string, any>(
+      categories.map((cat: any) => [cat.category_id, cat])
+    );
 
     if (filters?.searchTerm) {
       const term = filters.searchTerm.trim().toLowerCase();
@@ -5231,8 +5270,10 @@ export const supplierService = {
       itemMap.set(item.po_id, list);
     }
 
-    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
-    const productMap = new Map(products.map((product) => [product.product_id, product]));
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all() as any[];
+    const productMap = new Map<string, any>(
+      products.map((product: any) => [product.product_id, product])
+    );
 
     return mapSupplierRowFromDb(supplier, {
       purchaseOrders: purchaseOrders.map((po) => ({
@@ -5264,22 +5305,24 @@ export const purchaseOrderService = {
 
     const supplierIds = rows.map((row) => row.supplier_id);
     const suppliers = supplierIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT * FROM suppliers WHERE supplier_id IN (${supplierIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...supplierIds)
-      : [];
-    const supplierMap = new Map(suppliers.map((supplier) => [supplier.supplier_id, supplier]));
+          .all(...supplierIds) as any[])
+      : ([] as any[]);
+    const supplierMap = new Map<string, any>(
+      suppliers.map((supplier: any) => [supplier.supplier_id, supplier])
+    );
 
     const poIds = rows.map((row) => row.po_id);
     const items = poIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT * FROM purchase_order_items WHERE po_id IN (${poIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...poIds)
-      : [];
+          .all(...poIds) as any[])
+      : ([] as any[]);
 
     const itemMap = new Map();
     for (const item of items) {
@@ -5288,10 +5331,16 @@ export const purchaseOrderService = {
       itemMap.set(item.po_id, list);
     }
 
-    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
-    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
-    const productMap = new Map(products.map((product) => [product.product_id, product]));
-    const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all() as any[];
+    const categories = db
+      .prepare("SELECT * FROM categories WHERE deleted_at IS NULL")
+      .all() as any[];
+    const productMap = new Map<string, any>(
+      products.map((product: any) => [product.product_id, product])
+    );
+    const categoryMap = new Map<string, any>(
+      categories.map((cat: any) => [cat.category_id, cat])
+    );
 
     return rows.map((row) => {
       const supplier = supplierMap.get(row.supplier_id) ?? null;
@@ -5480,10 +5529,16 @@ export const purchaseOrderService = {
       .prepare("SELECT * FROM purchase_order_items WHERE po_id = ? AND deleted_at IS NULL")
       .all(id);
 
-    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
-    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
-    const productMap = new Map(products.map((product) => [product.product_id, product]));
-    const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all() as any[];
+    const categories = db
+      .prepare("SELECT * FROM categories WHERE deleted_at IS NULL")
+      .all() as any[];
+    const productMap = new Map<string, any>(
+      products.map((product: any) => [product.product_id, product])
+    );
+    const categoryMap = new Map<string, any>(
+      categories.map((cat: any) => [cat.category_id, cat])
+    );
 
     return mapPurchaseOrderRowFromDb(row, {
       supplier,
@@ -5574,10 +5629,16 @@ export const purchaseOrderService = {
       .prepare("SELECT * FROM purchase_order_items WHERE po_id = ? AND deleted_at IS NULL")
       .all(id);
 
-    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all();
-    const categories = db.prepare("SELECT * FROM categories WHERE deleted_at IS NULL").all();
-    const productMap = new Map(products.map((product) => [product.product_id, product]));
-    const categoryMap = new Map(categories.map((cat) => [cat.category_id, cat]));
+    const products = db.prepare("SELECT * FROM products WHERE deleted_at IS NULL").all() as any[];
+    const categories = db
+      .prepare("SELECT * FROM categories WHERE deleted_at IS NULL")
+      .all() as any[];
+    const productMap = new Map<string, any>(
+      products.map((product: any) => [product.product_id, product])
+    );
+    const categoryMap = new Map<string, any>(
+      categories.map((cat: any) => [cat.category_id, cat])
+    );
 
     return mapPurchaseOrderRowFromDb(po, {
       supplier,
@@ -5699,13 +5760,15 @@ export const paymentService = {
 
     const invoiceIds = rows.map((row) => row.invoice_id);
     const invoices = invoiceIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT * FROM sales_invoices WHERE invoice_id IN (${invoiceIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...invoiceIds)
-      : [];
-    const invoiceMap = new Map(invoices.map((invoice) => [invoice.invoice_id, invoice]));
+          .all(...invoiceIds) as any[])
+      : ([] as any[]);
+    const invoiceMap = new Map<string, any>(
+      invoices.map((invoice: any) => [invoice.invoice_id, invoice])
+    );
 
     if (filters?.customerId) {
       rows = rows.filter((row) => {
@@ -5716,23 +5779,27 @@ export const paymentService = {
 
     const employeeIds = invoices.map((invoice) => invoice.employee_id).filter(Boolean);
     const employees = employeeIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT id, name, email FROM employee WHERE id IN (${employeeIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...employeeIds)
-      : [];
-    const employeeMap = new Map(employees.map((employee) => [employee.id, employee]));
+          .all(...employeeIds) as any[])
+      : ([] as any[]);
+    const employeeMap = new Map<string, any>(
+      employees.map((employee: any) => [employee.id, employee])
+    );
 
     const customerIds = invoices.map((invoice) => invoice.customer_id).filter(Boolean);
     const customers = customerIds.length
-      ? db
+      ? (db
           .prepare(
             `SELECT customer_id, name, email FROM customers WHERE customer_id IN (${customerIds.map(() => "?").join(", ")}) AND deleted_at IS NULL`
           )
-          .all(...customerIds)
-      : [];
-    const customerMap = new Map(customers.map((customer) => [customer.customer_id, customer]));
+          .all(...customerIds) as any[])
+      : ([] as any[]);
+    const customerMap = new Map<string, any>(
+      customers.map((customer: any) => [customer.customer_id, customer])
+    );
 
     return rows.map((row) => {
       const invoice = invoiceMap.get(row.invoice_id);
