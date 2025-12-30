@@ -292,6 +292,18 @@ interface StockTransaction {
   product?: Product & { category?: Category };
 }
 
+interface SyncConflict {
+  conflict_id: string;
+  table_name: string;
+  row_id: string;
+  local_payload: string;
+  remote_payload: string;
+  local_version: number | null;
+  remote_version: number | null;
+  detected_at: string;
+  resolved_at: string | null;
+}
+
 interface ReceiptData {
   header?: string;
   storeName?: string;
@@ -534,6 +546,10 @@ declare global {
       };
       sync: {
         getStatus: () => Promise<{ state: "idle" | "syncing" | "error" | "offline"; error: string | null }>;
+      };
+      syncConflicts: {
+        list: (includeResolved?: boolean) => Promise<SyncConflict[]>;
+        resolve: (conflictId: string) => Promise<{ success: boolean }>;
       };
       settings: {
         findMany: () => Promise<Setting[]>;

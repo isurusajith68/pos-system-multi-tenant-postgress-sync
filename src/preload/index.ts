@@ -311,6 +311,10 @@ const api = {
   sync: {
     getStatus: () => ipcRenderer.invoke("sync:status")
   },
+  syncConflicts: {
+    list: (includeResolved?: boolean) => ipcRenderer.invoke("syncConflicts:list", includeResolved),
+    resolve: (conflictId: string) => ipcRenderer.invoke("syncConflicts:resolve", conflictId)
+  },
   suppliers: {
     findMany: () => ipcRenderer.invoke("suppliers:findMany"),
     create: (data: SupplierData) => ipcRenderer.invoke("suppliers:create", data),

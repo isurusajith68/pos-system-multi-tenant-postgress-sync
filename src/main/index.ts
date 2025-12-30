@@ -33,8 +33,10 @@ import { licenseService } from "./lib/license";
 import {
   bootstrapLocalFromServer,
   ensureDeviceId,
+  listSyncConflicts,
   pullChanges,
   pushOutbox,
+  resolveSyncConflict,
   setTenantId,
   syncNow
 } from "./lib/sync";
@@ -1931,6 +1933,24 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("sync:bootstrap", async () => {
     return await bootstrapLocalFromServer();
+  });
+
+  ipcMain.handle("syncConflicts:list", async (_, includeResolved?: boolean) => {
+    try {
+      return listSyncConflicts(Boolean(includeResolved));
+    } catch (error) {
+      console.error("Error listing sync conflicts:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("syncConflicts:resolve", async (_, conflictId: string) => {
+    try {
+      return { success: resolveSyncConflict(conflictId) };
+    } catch (error) {
+      console.error("Error resolving sync conflict:", error);
+      throw error;
+    }
   });
 
   // License activation is not required - start the app directly

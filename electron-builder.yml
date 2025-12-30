@@ -27,6 +27,8 @@ extraResources:
     to: "generated"
   - from: "src/renderer/src/assets"
     to: "assets"
+  - from: "resources/sqlite-schema.sql"
+    to: "resources/sqlite-schema.sql"
 win:
   executableName: pos
   # icon: build/icon.ico

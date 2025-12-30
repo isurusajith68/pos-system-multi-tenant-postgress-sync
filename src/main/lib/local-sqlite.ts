@@ -24,6 +24,8 @@ const resolveLocalDbPath = (): string => {
 
 const resolveSchemaPath = (): string => {
   const candidates = [
+    resolve(process.resourcesPath ?? "", "resources", "sqlite-schema.sql"),
+    resolve(process.resourcesPath ?? "", "sqlite-schema.sql"),
     resolve(process.cwd(), "resources", "sqlite-schema.sql"),
     resolve(__dirname, "../../resources/sqlite-schema.sql"),
     resolve(__dirname, "../../../resources/sqlite-schema.sql")

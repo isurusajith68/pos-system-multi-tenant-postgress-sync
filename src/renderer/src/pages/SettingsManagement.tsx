@@ -110,6 +110,18 @@ interface UpdateStatePayload {
   total?: number;
 }
 
+interface SyncConflict {
+  conflict_id: string;
+  table_name: string;
+  row_id: string;
+  local_payload: string;
+  remote_payload: string;
+  local_version: number | null;
+  remote_version: number | null;
+  detected_at: string;
+  resolved_at: string | null;
+}
+
 const SettingsManagement: React.FC = () => {
   const { t, changeLanguage } = useTranslation();
   const { currentUser } = useCurrentUser();
@@ -152,6 +164,9 @@ const SettingsManagement: React.FC = () => {
   });
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updatePayload, setUpdatePayload] = useState<UpdateStatePayload | null>(null);
+  const [syncConflicts, setSyncConflicts] = useState<SyncConflict[]>([]);
+  const [loadingSyncConflicts, setLoadingSyncConflicts] = useState(false);
+  const [resolvingConflictId, setResolvingConflictId] = useState<string | null>(null);
 
   // useEffect moved to after function definitions
 
@@ -200,8 +215,6 @@ const SettingsManagement: React.FC = () => {
     },
     [changeLanguage]
   );
-
-  
 
   const loadPrinters = useCallback(async (): Promise<void> => {
     try {
@@ -558,35 +571,67 @@ const SettingsManagement: React.FC = () => {
     }
   }, [t]);
 
+  const loadSyncConflicts = useCallback(async () => {
+    try {
+      setLoadingSyncConflicts(true);
+      const conflicts = await window.api.syncConflicts.list();
+      setSyncConflicts(conflicts ?? []);
+    } catch (error) {
+      console.error("Error loading sync conflicts:", error);
+      toast.error(t("Failed to load sync conflicts"));
+    } finally {
+      setLoadingSyncConflicts(false);
+    }
+  }, [t]);
+
+  const resolveSyncConflict = useCallback(
+    async (conflictId: string): Promise<void> => {
+      try {
+        setResolvingConflictId(conflictId);
+        const result = await window.api.syncConflicts.resolve(conflictId);
+        if (!result?.success) {
+          toast.error(t("Failed to resolve conflict"));
+          return;
+        }
+        toast.success(t("Conflict marked as resolved"));
+        await loadSyncConflicts();
+      } catch (error) {
+        console.error("Error resolving sync conflict:", error);
+        toast.error(t("Failed to resolve conflict"));
+      } finally {
+        setResolvingConflictId(null);
+      }
+    },
+    [loadSyncConflicts, t]
+  );
+
   const handleSyncOut = useCallback(async () => {
     try {
       setLoading(true);
       const result = await window.electron.ipcRenderer.invoke("sync:push");
-      toast.success(
-        t("Uploaded {count} changes", { count: result?.acked ?? 0 })
-      );
+      toast.success(t("Uploaded {count} changes", { count: result?.acked ?? 0 }));
+      await loadSyncConflicts();
     } catch (error) {
       console.error("Error pushing sync:", error);
       toast.error(t("Failed to sync out"));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [loadSyncConflicts, t]);
 
   const handleSyncIn = useCallback(async () => {
     try {
       setLoading(true);
       const result = await window.electron.ipcRenderer.invoke("sync:pull");
-      toast.success(
-        t("Pulled {count} changes", { count: result?.applied ?? 0 })
-      );
+      toast.success(t("Pulled {count} changes", { count: result?.applied ?? 0 }));
+      await loadSyncConflicts();
     } catch (error) {
       console.error("Error pulling sync:", error);
       toast.error(t("Failed to sync in"));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [loadSyncConflicts, t]);
 
   const createRole = useCallback(
     async (name: string, description: string): Promise<void> => {
@@ -645,18 +690,18 @@ const SettingsManagement: React.FC = () => {
   );
 
   const sections = [
-  { key: "general", label: "General Settings", icon: "G" },
-  { key: "employees", label: "Employee", icon: "E" },
-  { key: "printer", label: "Printer", icon: "P" },
-  { key: "scanner", label: "Scanner", icon: "S" },
-  { key: "system", label: "System Preferences", icon: "SYS" },
-  { key: "sync", label: "Sync", icon: "SYNC" },
-  { key: "backup", label: "Backup", icon: "B" },
-  { key: "security", label: "Security", icon: "SEC" },
-  { key: "notifications", label: "Notifications", icon: "N" },
-  { key: "updates", label: "Updates", icon: "U" },
-  { key: "help", label: "Help", icon: "H" }
-];
+    { key: "general", label: "General ", icon: "⚙️" },
+    { key: "employees", label: "Employee", icon: "👥" },
+    { key: "printer", label: "Printer", icon: "🖨️" },
+    { key: "scanner", label: "Scanner", icon: "📷" },
+    { key: "system", label: "System ", icon: "🖥️" },
+    { key: "sync", label: "Sync", icon: "↳↰" },
+    { key: "backup", label: "Backup", icon: "💾" },
+    { key: "security", label: "Security", icon: "🔒" },
+    { key: "notifications", label: "Notifications", icon: "🔔" },
+    { key: "updates", label: "Updates", icon: "🔄" },
+    { key: "help", label: "Help", icon: "❓" }
+  ];
 
   const downloadPercent = Math.min(100, Math.max(0, updatePayload?.percent ?? 0));
   const releaseNotesText =
@@ -1069,7 +1114,9 @@ const SettingsManagement: React.FC = () => {
         return (
           <div className="flex items-center justify-between">
             <div>
-              <h4 className="text-sm font-medium text-gray-900 dark:text-slate-100">{translatedLabel}</h4>
+              <h4 className="text-sm font-medium text-gray-900 dark:text-slate-100">
+                {translatedLabel}
+              </h4>
               <p className="text-sm text-gray-500 dark:text-slate-400">{translatedDescription}</p>
             </div>
             <button
@@ -1091,8 +1138,12 @@ const SettingsManagement: React.FC = () => {
       case "select":
         return (
           <div>
-            <h4 className="text-sm font-medium text-gray-900 dark:text-slate-100 mb-1">{translatedLabel}</h4>
-            <p className="text-sm text-gray-500 dark:text-slate-400 mb-3">{translatedDescription}</p>
+            <h4 className="text-sm font-medium text-gray-900 dark:text-slate-100 mb-1">
+              {translatedLabel}
+            </h4>
+            <p className="text-sm text-gray-500 dark:text-slate-400 mb-3">
+              {translatedDescription}
+            </p>
             <select
               value={String(item.value ?? "")}
               onChange={(e) => updateSetting(item.id, e.target.value)}
@@ -1113,8 +1164,12 @@ const SettingsManagement: React.FC = () => {
       case "input":
         return (
           <div>
-            <h4 className="text-sm font-medium text-gray-900 dark:text-slate-100 mb-1">{translatedLabel}</h4>
-            <p className="text-sm text-gray-500 dark:text-slate-400 mb-3">{translatedDescription}</p>
+            <h4 className="text-sm font-medium text-gray-900 dark:text-slate-100 mb-1">
+              {translatedLabel}
+            </h4>
+            <p className="text-sm text-gray-500 dark:text-slate-400 mb-3">
+              {translatedDescription}
+            </p>
             <input
               type={
                 ["taxRate", "lowStockThreshold", "backupRetention"].includes(item.id)
@@ -1135,7 +1190,9 @@ const SettingsManagement: React.FC = () => {
         return (
           <div className="flex items-center justify-between">
             <div>
-              <h4 className="text-sm font-medium text-gray-900 dark:text-slate-100">{translatedLabel}</h4>
+              <h4 className="text-sm font-medium text-gray-900 dark:text-slate-100">
+                {translatedLabel}
+              </h4>
               <p className="text-sm text-gray-500 dark:text-slate-400">{translatedDescription}</p>
             </div>
             <button
@@ -1152,6 +1209,127 @@ const SettingsManagement: React.FC = () => {
     }
   };
 
+  const formatJsonPayload = (payload: string): string => {
+    try {
+      return JSON.stringify(JSON.parse(payload), null, 2);
+    } catch {
+      return payload;
+    }
+  };
+
+  const renderSyncConflicts = (): React.ReactNode => {
+    return (
+      <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">
+              {t("Sync Conflicts")}
+            </h3>
+            <p className="text-sm text-gray-500 dark:text-slate-400">
+              {t("Resolve mismatched changes between local and server data")}
+            </p>
+          </div>
+          <button
+            onClick={() => loadSyncConflicts()}
+            className="px-3 py-1.5 text-sm font-medium bg-gray-200 dark:bg-slate-800 text-gray-700 dark:text-slate-200 rounded-lg hover:bg-gray-300 dark:hover:bg-slate-700 transition-colors"
+          >
+            {loadingSyncConflicts ? t("Loading...") : t("Refresh")}
+          </button>
+        </div>
+
+        <div className="mt-4">
+          {loadingSyncConflicts && (
+            <p className="text-sm text-gray-500 dark:text-slate-400">{t("Loading conflicts...")}</p>
+          )}
+
+          {!loadingSyncConflicts && syncConflicts.length === 0 && (
+            <p className="text-sm text-gray-500 dark:text-slate-400">
+              {t("No sync conflicts detected")}
+            </p>
+          )}
+
+          {!loadingSyncConflicts &&
+            syncConflicts.map((conflict) => {
+              const detectedAt = conflict.detected_at
+                ? new Date(conflict.detected_at).toLocaleString()
+                : "-";
+              const localVersion =
+                conflict.local_version !== null && conflict.local_version !== undefined
+                  ? conflict.local_version
+                  : "-";
+              const remoteVersion =
+                conflict.remote_version !== null && conflict.remote_version !== undefined
+                  ? conflict.remote_version
+                  : "-";
+
+              return (
+                <details
+                  key={conflict.conflict_id}
+                  className="mt-3 rounded-lg border border-gray-200 dark:border-slate-700 bg-gray-50 dark:bg-slate-950 p-4"
+                >
+                  <summary className="flex flex-wrap items-center justify-between cursor-pointer gap-2">
+                    <div>
+                      <p className="text-sm font-medium text-gray-900 dark:text-slate-100">
+                        {conflict.table_name}
+                      </p>
+                      <p className="text-xs text-gray-500 dark:text-slate-400 break-all">
+                        {conflict.row_id}
+                      </p>
+                    </div>
+                    <div className="text-xs text-gray-500 dark:text-slate-400">
+                      {t("Local v{local} / Server v{remote}", {
+                        local: localVersion,
+                        remote: remoteVersion
+                      })}
+                    </div>
+                  </summary>
+
+                  <div className="mt-3 text-xs text-gray-500 dark:text-slate-400">
+                    {t("Detected at")} {detectedAt}
+                  </div>
+
+                  <div className="mt-4 grid gap-4 md:grid-cols-2">
+                    <div>
+                      <p className="text-xs font-semibold text-gray-700 dark:text-slate-200 mb-2">
+                        {t("Local Payload")}
+                      </p>
+                      <pre className="text-xs whitespace-pre-wrap break-all bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-700 rounded-md p-3">
+                        {formatJsonPayload(conflict.local_payload)}
+                      </pre>
+                    </div>
+                    <div>
+                      <p className="text-xs font-semibold text-gray-700 dark:text-slate-200 mb-2">
+                        {t("Server Payload")}
+                      </p>
+                      <pre className="text-xs whitespace-pre-wrap break-all bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-700 rounded-md p-3">
+                        {formatJsonPayload(conflict.remote_payload)}
+                      </pre>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 flex justify-end">
+                    <button
+                      onClick={() => resolveSyncConflict(conflict.conflict_id)}
+                      disabled={resolvingConflictId === conflict.conflict_id}
+                      className={`px-3 py-1.5 text-sm font-medium rounded-lg transition-colors ${
+                        resolvingConflictId === conflict.conflict_id
+                          ? "bg-gray-300 text-gray-600 dark:bg-slate-800 dark:text-slate-400 cursor-not-allowed"
+                          : "bg-blue-600 text-white hover:bg-blue-700"
+                      }`}
+                    >
+                      {resolvingConflictId === conflict.conflict_id
+                        ? t("Resolving...")
+                        : t("Mark Resolved")}
+                    </button>
+                  </div>
+                </details>
+              );
+            })}
+        </div>
+      </div>
+    );
+  };
+
   useEffect(() => {
     loadSettings();
     loadBackupStats();
@@ -1163,6 +1341,12 @@ const SettingsManagement: React.FC = () => {
     // settings on every dependency change which can overwrite unsaved edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (activeSection === "sync") {
+      void loadSyncConflicts();
+    }
+  }, [activeSection, loadSyncConflicts]);
 
   const getCurrentSettings = (): SettingItem[] => {
     switch (activeSection) {
@@ -1195,16 +1379,22 @@ const SettingsManagement: React.FC = () => {
         <div className="space-y-6">
           <div className="bg-white dark:bg-slate-900 rounded-lg border border-gray-200 dark:border-slate-700 shadow-sm p-6 space-y-6">
             <div className="space-y-2">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">{t("Automatic Updates")}</h3>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">
+                {t("Automatic Updates")}
+              </h3>
               <p className="text-sm text-gray-600 dark:text-slate-400">
                 {t(
                   "Keep your Zentra POS up to date: check for new releases, download installers, and apply fixes automatically."
                 )}
               </p>
               <div className="flex items-center justify-between gap-4">
-                <div className="text-sm font-medium text-gray-700 dark:text-slate-200">{updateStatusLabel}</div>
+                <div className="text-sm font-medium text-gray-700 dark:text-slate-200">
+                  {updateStatusLabel}
+                </div>
                 {updatePayload?.version && (
-                  <span className="text-xs text-gray-500 dark:text-slate-400">v{updatePayload.version}</span>
+                  <span className="text-xs text-gray-500 dark:text-slate-400">
+                    v{updatePayload.version}
+                  </span>
                 )}
               </div>
               {releaseNotesText && (
@@ -1247,8 +1437,12 @@ const SettingsManagement: React.FC = () => {
           <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
             <div className="text-center py-8">
               <div className="text-6xl mb-4">🔒</div>
-              <h3 className="text-xl font-semibold text-gray-900 dark:text-slate-100 mb-2">{t("Access Denied")}</h3>
-              <p className="text-gray-600 dark:text-slate-400">{t("You don't have permission to manage employees.")}</p>
+              <h3 className="text-xl font-semibold text-gray-900 dark:text-slate-100 mb-2">
+                {t("Access Denied")}
+              </h3>
+              <p className="text-gray-600 dark:text-slate-400">
+                {t("You don't have permission to manage employees.")}
+              </p>
               <p className="text-sm text-gray-500 dark:text-slate-400 mt-2">
                 {t("Contact your administrator if you need access to this section.")}
               </p>
@@ -1266,7 +1460,9 @@ const SettingsManagement: React.FC = () => {
           <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
             <div className="text-center py-8">
               <div className="text-6xl mb-4">🔒</div>
-              <h3 className="text-xl font-semibold text-gray-900 dark:text-slate-100 mb-2">{t("Access Denied")}</h3>
+              <h3 className="text-xl font-semibold text-gray-900 dark:text-slate-100 mb-2">
+                {t("Access Denied")}
+              </h3>
               <p className="text-gray-600 dark:text-slate-400">
                 {t("You don't have permission to access security settings.")}
               </p>
@@ -1282,10 +1478,15 @@ const SettingsManagement: React.FC = () => {
         <div className="space-y-6">
           {canManageRoles && (
             <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">{t("System Management")}</h3>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">
+                {t("System Management")}
+              </h3>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {securitySettings.slice(0, 2).map((item) => (
-                  <div key={item.id} className="border border-gray-200 dark:border-slate-700 rounded-lg p-4">
+                  <div
+                    key={item.id}
+                    className="border border-gray-200 dark:border-slate-700 rounded-lg p-4"
+                  >
                     {renderSettingItem(item)}
                   </div>
                 ))}
@@ -1296,7 +1497,9 @@ const SettingsManagement: React.FC = () => {
           {canManageRoles && (
             <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
               <div className="flex justify-between items-center mb-4">
-                <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">{t("User Roles")}</h3>
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">
+                  {t("User Roles")}
+                </h3>
                 <button
                   onClick={() => {
                     if (!canManageRoles) {
@@ -1313,7 +1516,10 @@ const SettingsManagement: React.FC = () => {
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {roles.map((role) => (
-                  <div key={role.id} className="border border-gray-200 dark:border-slate-700 rounded-lg p-4">
+                  <div
+                    key={role.id}
+                    className="border border-gray-200 dark:border-slate-700 rounded-lg p-4"
+                  >
                     <div className="flex justify-between items-start mb-2">
                       <h4 className="font-medium text-gray-900 dark:text-slate-100">{role.name}</h4>
                       {role.isSystem && (
@@ -1322,7 +1528,9 @@ const SettingsManagement: React.FC = () => {
                         </span>
                       )}
                     </div>
-                    <p className="text-sm text-gray-600 dark:text-slate-400 mb-3">{role.description}</p>
+                    <p className="text-sm text-gray-600 dark:text-slate-400 mb-3">
+                      {role.description}
+                    </p>
                     <div className="flex space-x-2">
                       <button
                         onClick={async () => {
@@ -1410,7 +1618,10 @@ const SettingsManagement: React.FC = () => {
 
               <div className="space-y-4">
                 {permissionGroups.map((group) => (
-                  <div key={group.module} className="border border-gray-100 dark:border-slate-700 rounded-lg p-4">
+                  <div
+                    key={group.module}
+                    className="border border-gray-100 dark:border-slate-700 rounded-lg p-4"
+                  >
                     <h4 className="font-medium text-gray-900 dark:text-slate-100 mb-2 capitalize">
                       {t(group.module)} {t("Permissions")}
                     </h4>
@@ -1438,7 +1649,9 @@ const SettingsManagement: React.FC = () => {
 
           {canEditSettings && (
             <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">{t("Security Settings")}</h3>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">
+                {t("Security Settings")}
+              </h3>
               <div className="space-y-4">
                 {securitySettings.slice(3).map((item) => (
                   <div key={item.id}>{renderSettingItem(item)}</div>
@@ -1454,12 +1667,16 @@ const SettingsManagement: React.FC = () => {
       return (
         <div className="space-y-6">
           <div className="bg-white dark:bg-slate-900 rounded-lg border border-gray-200 dark:border-slate-700 shadow-sm p-6">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">{t("Developer Contact")}</h3>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">
+              {t("Developer Contact")}
+            </h3>
             <div className="space-y-4">
               <div className="flex items-center space-x-4">
                 <div className="text-4xl">👨‍💻</div>
                 <div>
-                  <h4 className="text-md font-medium text-gray-900 dark:text-slate-100">Isuru Sajith</h4>
+                  <h4 className="text-md font-medium text-gray-900 dark:text-slate-100">
+                    Isuru Sajith
+                  </h4>
                   <p className="text-sm text-gray-600 dark:text-slate-400">Lead Developer</p>
                 </div>
               </div>
@@ -1539,8 +1756,12 @@ const SettingsManagement: React.FC = () => {
         <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
           <div className="text-center py-8">
             <div className="text-6xl mb-4">🔒</div>
-            <h3 className="text-xl font-semibold text-gray-900 dark:text-slate-100 mb-2">{t("Access Denied")}</h3>
-            <p className="text-gray-600 dark:text-slate-400">{t("Don't have permission to view backup settings.")}</p>
+            <h3 className="text-xl font-semibold text-gray-900 dark:text-slate-100 mb-2">
+              {t("Access Denied")}
+            </h3>
+            <p className="text-gray-600 dark:text-slate-400">
+              {t("Don't have permission to view backup settings.")}
+            </p>
             <p className="text-sm text-gray-500 dark:text-slate-400 mt-2">
               {t("Contact developer if you need access to this section.")}
             </p>
@@ -1554,8 +1775,12 @@ const SettingsManagement: React.FC = () => {
         <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
           <div className="text-center py-8">
             <div className="text-6xl mb-4">🔒</div>
-            <h3 className="text-xl font-semibold text-gray-900 dark:text-slate-100 mb-2">{t("Access Denied")}</h3>
-            <p className="text-gray-600 dark:text-slate-400">{t("You don't have permission to view settings.")}</p>
+            <h3 className="text-xl font-semibold text-gray-900 dark:text-slate-100 mb-2">
+              {t("Access Denied")}
+            </h3>
+            <p className="text-gray-600 dark:text-slate-400">
+              {t("You don't have permission to view settings.")}
+            </p>
             <p className="text-sm text-gray-500 dark:text-slate-400 mt-2">
               {t("Contact your administrator if you need access to this section.")}
             </p>
@@ -1569,10 +1794,14 @@ const SettingsManagement: React.FC = () => {
     return (
       <div className="space-y-6">
         {currentSettings.map((item) => (
-          <div key={item.id} className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6">
+          <div
+            key={item.id}
+            className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-6"
+          >
             {renderSettingItem(item)}
           </div>
         ))}
+        {activeSection === "sync" && renderSyncConflicts()}
       </div>
     );
   };
@@ -1583,7 +1812,9 @@ const SettingsManagement: React.FC = () => {
         <div className="mb-6">
           <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
             <div>
-              <h1 className="text-3xl font-bold text-gray-900 dark:text-slate-100 mb-2">{t("Settings Dashboard")}</h1>
+              <h1 className="text-3xl font-bold text-gray-900 dark:text-slate-100 mb-2">
+                {t("Settings Dashboard")}
+              </h1>
               <p className="text-gray-600 dark:text-slate-400">
                 {t("Manage your Zentra POS system settings and configurations")}
               </p>
@@ -1667,7 +1898,9 @@ const SettingsManagement: React.FC = () => {
             <div className="bg-white dark:bg-slate-900 rounded-lg shadow-xl max-w-md w-full mx-4">
               <div className="p-6">
                 <div className="flex justify-between items-center mb-4">
-                  <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">{t("Create New Role")}</h3>
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">
+                    {t("Create New Role")}
+                  </h3>
                   <button
                     onClick={() => setShowCreateRoleModal(false)}
                     className="text-gray-400 hover:text-gray-600 dark:text-slate-400"
@@ -1777,7 +2010,10 @@ const SettingsManagement: React.FC = () => {
                   <div className="max-h-96 overflow-y-auto">
                     <div className="space-y-6">
                       {permissionGroups.map((group) => (
-                        <div key={group.module} className="border border-gray-200 dark:border-slate-700 rounded-lg p-4">
+                        <div
+                          key={group.module}
+                          className="border border-gray-200 dark:border-slate-700 rounded-lg p-4"
+                        >
                           <h4 className="text-lg font-medium text-gray-900 dark:text-slate-100 mb-3 capitalize">
                             {t(group.module)} {t("Module")}
                           </h4>
@@ -1845,4 +2081,3 @@ const SettingsManagement: React.FC = () => {
 };
 
 export default SettingsManagement;
-

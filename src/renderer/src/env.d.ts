@@ -79,6 +79,10 @@ interface Window {
     sync: {
       getStatus: () => Promise<{ state: "idle" | "syncing" | "error" | "offline"; error: string | null }>;
     };
+    syncConflicts: {
+      list: (includeResolved?: boolean) => Promise<any[]>;
+      resolve: (conflictId: string) => Promise<{ success: boolean }>;
+    };
     suppliers: {
       findMany: () => Promise<any[]>;
       create: (data: any) => Promise<any>;

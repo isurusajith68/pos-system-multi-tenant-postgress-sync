@@ -557,9 +557,7 @@ const POSSystem2: React.FC = () => {
                 ? item.discountedPrice
                 : undefined
             : paymentMode === "credit"
-              ? creditPriceMode === "discounted" &&
-                item.discountedPrice &&
-                item.discountedPrice > 0
+              ? creditPriceMode === "discounted" && item.discountedPrice && item.discountedPrice > 0
                 ? item.discountedPrice
                 : undefined
               : item.discountedPrice && item.discountedPrice > 0
@@ -734,9 +732,7 @@ const POSSystem2: React.FC = () => {
         }
       } else if (paymentMode === "credit") {
         derivedSalePrice =
-          creditPriceMode === "discounted" &&
-          product.discountedPrice &&
-          product.discountedPrice > 0
+          creditPriceMode === "discounted" && product.discountedPrice && product.discountedPrice > 0
             ? product.discountedPrice
             : undefined;
       } else {
@@ -1012,8 +1008,7 @@ const POSSystem2: React.FC = () => {
         };
 
         const invoiceResult = await window.api.salesInvoices.create(salesInvoiceData);
-        const invoiceNumber =
-          invoiceResult?.invoice_id || invoiceResult?.id || `INV-${Date.now()}`;
+        const invoiceNumber = invoiceResult?.invoice_id || invoiceResult?.id || `INV-${Date.now()}`;
 
         if (received > 0) {
           await window.api.payments.create({
@@ -1049,6 +1044,7 @@ const POSSystem2: React.FC = () => {
         }
 
         clearCart();
+        localStorage.removeItem(savedCartKey);
         setReceivedAmount("");
         setTotalDiscountAmount(0);
         setSelectedCustomer("");
@@ -1095,6 +1091,67 @@ const POSSystem2: React.FC = () => {
   const clearCartRef = useRef(clearCart);
   const processPaymentRef = useRef(processPayment);
   const applyBulkDiscountRef = useRef(applyBulkDiscount);
+  const savedCartKey = useMemo(
+    () => `pos_saved_cart_${user?.tenantId ?? "default"}`,
+    [user?.tenantId]
+  );
+  const [showRestoreCartModal, setShowRestoreCartModal] = useState(false);
+  const [dismissedRestorePrompt, setDismissedRestorePrompt] = useState(false);
+  const [savedCartMeta, setSavedCartMeta] = useState<{ count: number; savedAt?: string } | null>(
+    null
+  );
+
+  const readSavedCart = useCallback(() => {
+    const raw = localStorage.getItem(savedCartKey);
+    if (!raw) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(raw) as { items?: CartItem[]; savedAt?: string };
+      if (!parsed?.items || parsed.items.length === 0) {
+        return null;
+      }
+      return parsed;
+    } catch (error) {
+      console.error("Failed to parse saved cart:", error);
+      return null;
+    }
+  }, [savedCartKey]);
+
+  const saveCart = useCallback((): void => {
+    if (cartItems.length === 0) {
+      toast.error(t("pos.toast.cartEmpty"));
+      return;
+    }
+
+    const payload = {
+      items: cartItems,
+      savedAt: new Date().toISOString()
+    };
+
+    localStorage.setItem(savedCartKey, JSON.stringify(payload));
+    toast.success(t("pos.toast.cartSaved"));
+  }, [cartItems, savedCartKey, t]);
+
+  const loadSavedCart = useCallback((): void => {
+    const saved = readSavedCart();
+    if (!saved) {
+      toast.error(t("pos.toast.cartEmpty"));
+      setShowRestoreCartModal(false);
+      return;
+    }
+
+    setCartItems(saved.items ?? []);
+    setSelectedCartItemIndex(saved.items && saved.items.length > 0 ? 0 : -1);
+    setShowRestoreCartModal(false);
+    setDismissedRestorePrompt(true);
+    toast.success(t("pos.toast.cartLoaded"));
+  }, [readSavedCart, savedCartKey, t]);
+
+  const dismissRestoreCart = useCallback(() => {
+    setShowRestoreCartModal(false);
+    setDismissedRestorePrompt(true);
+  }, []);
 
   useEffect(() => {
     addToCartRef.current = addToCartWithQuantity;
@@ -1121,6 +1178,20 @@ const POSSystem2: React.FC = () => {
       document.removeEventListener("mousedown", handleClickOutside);
     };
   }, [showCustomerDropdown]);
+
+  useEffect(() => {
+    if (dismissedRestorePrompt || cartItems.length > 0) {
+      return;
+    }
+    const saved = readSavedCart();
+    if (saved) {
+      setSavedCartMeta({
+        count: saved.items?.length ?? 0,
+        savedAt: saved.savedAt
+      });
+      setShowRestoreCartModal(true);
+    }
+  }, [cartItems.length, dismissedRestorePrompt, readSavedCart]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -1164,6 +1235,12 @@ const POSSystem2: React.FC = () => {
         if (cartItems.length > 0) {
           openPaymentConfirmation();
         }
+      }
+
+      // Ctrl/Cmd + S - Save Cart
+      if ((event.ctrlKey || event.metaKey) && (event.key === "s" || event.key === "S")) {
+        event.preventDefault();
+        saveCart();
       }
 
       // Ctrl/Cmd + Shift + D - Clear Cart
@@ -1252,7 +1329,11 @@ const POSSystem2: React.FC = () => {
       }
 
       // Ctrl/Cmd + D - Focus Discount Input
-      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && (event.key === "d" || event.key === "D")) {
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        !event.shiftKey &&
+        (event.key === "d" || event.key === "D")
+      ) {
         event.preventDefault();
         event.stopPropagation();
         setTimeout(() => {
@@ -1411,7 +1492,8 @@ const POSSystem2: React.FC = () => {
     orderedCategories,
     selectedProductIndex,
     selectedCartItemIndex,
-    showPaymentConfirmation
+    showPaymentConfirmation,
+    saveCart
   ]);
 
   // Reset selected product index when search or category changes
@@ -1749,7 +1831,6 @@ const POSSystem2: React.FC = () => {
       <div className="w-[40%] p-4  flex flex-col gap-4 border-r border-gray-300 dark:border-slate-700">
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-3">
-           
             <h2 className="text-lg font-semibold text-gray-700 dark:text-white">Cart</h2>
             <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-100 text-blue-700 border border-blue-200 ml-1 dark:bg-blue-900/40 dark:text-blue-200 dark:border-blue-800">
               <svg
@@ -1768,6 +1849,12 @@ const POSSystem2: React.FC = () => {
               {cartItems.length} {cartItems.length === 1 ? t("item") : t("items")}
             </span>
           </div>
+          <button
+            onClick={saveCart}
+            className="px-3 py-1.5 bg-white border border-blue-200 text-blue-700 rounded-md text-xs font-semibold hover:bg-blue-50 transition-colors shadow-sm dark:bg-slate-900 dark:text-blue-200 dark:border-blue-700/60 dark:hover:bg-slate-800"
+          >
+            {t("Save Cart")}
+          </button>
         </div>
         <div className="mb-2">
           <div className="grid grid-cols-12 gap-2 text-xs font-semibold text-gray-600 dark:text-slate-300 border-b pb-2 dark:border-slate-700">
@@ -1902,34 +1989,34 @@ const POSSystem2: React.FC = () => {
           </div>
           <div className="mt-2">
             {paymentMode === "credit" && (
-            <div className="mb-3">
-              <label className="text-xs font-semibold text-gray-500  tracking-wide ">
-                {t("What price use for this sale")}
-              </label>
-              <div className="grid grid-cols-2 gap-2 mt-2">
-                <button
-                  onClick={() => setCreditPriceMode("discounted")}
-                  className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-                    creditPriceMode === "discounted"
-                      ? "bg-blue-500 text-white shadow-sm dark:bg-blue-600"
-                      : "bg-white text-gray-700 hover:bg-gray-100 dark:bg-slate-900 dark:text-slate-100 dark:border-slate-700 dark:hover:bg-slate-800 border border-gray-200"
-                  }`}
-                >
-                  {t("Discounted")}
-                </button>
-                <button
-                  onClick={() => setCreditPriceMode("regular")}
-                  className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-                    creditPriceMode === "regular"
-                      ? "bg-blue-500 text-white shadow-sm dark:bg-blue-600"
-                      : "bg-white text-gray-700 hover:bg-gray-100 dark:bg-slate-900 dark:text-slate-100 dark:border-slate-700 dark:hover:bg-slate-800 border border-gray-200"
-                  }`}
-                >
-                  {t("Regular")}
-                </button>
+              <div className="mb-3">
+                <label className="text-xs font-semibold text-gray-500  tracking-wide ">
+                  {t("What price use for this sale")}
+                </label>
+                <div className="grid grid-cols-2 gap-2 mt-2">
+                  <button
+                    onClick={() => setCreditPriceMode("discounted")}
+                    className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${
+                      creditPriceMode === "discounted"
+                        ? "bg-blue-500 text-white shadow-sm dark:bg-blue-600"
+                        : "bg-white text-gray-700 hover:bg-gray-100 dark:bg-slate-900 dark:text-slate-100 dark:border-slate-700 dark:hover:bg-slate-800 border border-gray-200"
+                    }`}
+                  >
+                    {t("Discounted")}
+                  </button>
+                  <button
+                    onClick={() => setCreditPriceMode("regular")}
+                    className={`px-3 py-2 rounded-lg text-xs font-medium transition-all ${
+                      creditPriceMode === "regular"
+                        ? "bg-blue-500 text-white shadow-sm dark:bg-blue-600"
+                        : "bg-white text-gray-700 hover:bg-gray-100 dark:bg-slate-900 dark:text-slate-100 dark:border-slate-700 dark:hover:bg-slate-800 border border-gray-200"
+                    }`}
+                  >
+                    {t("Regular")}
+                  </button>
+                </div>
               </div>
-            </div>
-          )}
+            )}
           </div>
         </div>
 
@@ -2102,14 +2189,15 @@ const POSSystem2: React.FC = () => {
                   }}
                   className="w-full px-3 py-2.5 text-sm rounded-lg surface-input"
                 />
-                {paymentMode === "cash" && receivedAmount && (
-                  <div className="flex justify-between items-center mt-2 pt-2 border-t border-gray-200 dark:border-slate-700">
-                    <span className="text-sm text-gray-600 dark:text-slate-400">Change</span>
-                    <span className="text-sm font-semibold text-green-600 dark:text-green-400">
-                      Rs. {(parseFloat(receivedAmount) - currentTotal).toFixed(2)}
-                    </span>
-                  </div>
-                )}
+                {(paymentMode === "cash" ||
+                  paymentMode === "wholesale") && receivedAmount && (
+                    <div className="flex justify-between items-center mt-2 pt-2 border-t border-gray-200 dark:border-slate-700">
+                      <span className="text-sm text-gray-600 dark:text-slate-400">Change</span>
+                      <span className="text-sm font-semibold text-green-600 dark:text-green-400">
+                        Rs. {(parseFloat(receivedAmount) - currentTotal).toFixed(2)}
+                      </span>
+                    </div>
+                  )}
               </div>
             )}
             {paymentMode === "credit" && (
@@ -2151,6 +2239,8 @@ const POSSystem2: React.FC = () => {
             >
               Clear
             </button>
+
+           
 
             <button
               type="button"
@@ -2698,6 +2788,39 @@ const POSSystem2: React.FC = () => {
       )}
 
       {/* Restore Cart Prompt Modal */}
+      {showRestoreCartModal && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+          style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}
+        >
+          <div className="surface-card rounded-lg p-6 w-full max-w-md">
+            <h3 className="text-lg font-semibold mb-3">{t("Restore Cart")}</h3>
+            <p className="text-sm text-gray-600 dark:text-slate-300 mb-4">
+              {t("Saved cart detected. Do you want to load it?")}
+            </p>
+            {savedCartMeta?.count ? (
+              <p className="text-xs text-gray-500 dark:text-slate-400 mb-4">
+                {t("Items")}: {savedCartMeta.count}
+                {savedCartMeta.savedAt ? ` · ${new Date(savedCartMeta.savedAt).toLocaleString()}` : ""}
+              </p>
+            ) : null}
+            <div className="flex gap-3">
+              <button
+                onClick={loadSavedCart}
+                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+              >
+                {t("Load Cart")}
+              </button>
+              <button
+                onClick={dismissRestoreCart}
+                className="flex-1 px-4 py-2 bg-gray-300 text-gray-700 rounded-lg hover:bg-gray-400 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600"
+              >
+                {t("Cancel")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Payment confirmation modal */}
       {showPaymentConfirmation && (
         <div

@@ -28,6 +28,18 @@ type SyncChangeRow = {
   payload: any;
 };
 
+type SyncConflictRow = {
+  conflict_id: string;
+  table_name: string;
+  row_id: string;
+  local_payload: string;
+  remote_payload: string;
+  local_version: number | null;
+  remote_version: number | null;
+  detected_at: string;
+  resolved_at: string | null;
+};
+
 const SYNC_TABLES = new Set<string>([
   "categories",
   "products",
@@ -572,6 +584,7 @@ const upsertCursor = async (
 };
 
 const upsertConflict = (conflict: {
+  conflictId?: string;
   tableName: string;
   rowId: string;
   localPayload: Record<string, any>;
@@ -580,9 +593,10 @@ const upsertConflict = (conflict: {
   remoteVersion?: number | null;
 }): void => {
   const db = getLocalDb();
+  const conflictId = conflict.conflictId ?? randomUUID();
   db.prepare(
     `
-      INSERT INTO sync_conflicts (
+      INSERT OR REPLACE INTO sync_conflicts (
         conflict_id,
         table_name,
         row_id,
@@ -595,7 +609,7 @@ const upsertConflict = (conflict: {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `
   ).run(
-    randomUUID(),
+    conflictId,
     conflict.tableName,
     conflict.rowId,
     JSON.stringify(conflict.localPayload),
@@ -677,6 +691,7 @@ export const pushOutbox = async (limit = 100): Promise<{ acked: number; conflict
             item.row_id
           );
           upsertConflict({
+            conflictId: item.outbox_id,
             tableName: item.table_name,
             rowId: item.row_id,
             localPayload: payload,
@@ -684,6 +699,7 @@ export const pushOutbox = async (limit = 100): Promise<{ acked: number; conflict
             localVersion: item.version,
             remoteVersion: currentVersion
           });
+          db.prepare("DELETE FROM sync_outbox WHERE outbox_id = ?").run(item.outbox_id);
           conflicts += 1;
           continue;
         }
@@ -703,6 +719,7 @@ export const pushOutbox = async (limit = 100): Promise<{ acked: number; conflict
             item.row_id
           );
           upsertConflict({
+            conflictId: item.outbox_id,
             tableName: item.table_name,
             rowId: item.row_id,
             localPayload: payload,
@@ -710,6 +727,7 @@ export const pushOutbox = async (limit = 100): Promise<{ acked: number; conflict
             localVersion: item.version,
             remoteVersion: currentVersion
           });
+          db.prepare("DELETE FROM sync_outbox WHERE outbox_id = ?").run(item.outbox_id);
           conflicts += 1;
           continue;
         }
@@ -735,6 +753,35 @@ export const pushOutbox = async (limit = 100): Promise<{ acked: number; conflict
   await recordDeviceSeen(tenantId, deviceId);
 
   return { acked, conflicts };
+};
+
+export const listSyncConflicts = (includeResolved = false): SyncConflictRow[] => {
+  const db = getLocalDb();
+  const whereClause = includeResolved ? "" : "WHERE resolved_at IS NULL";
+  return db
+    .prepare(
+      `
+        SELECT *
+        FROM sync_conflicts
+        ${whereClause}
+        ORDER BY detected_at DESC
+      `
+    )
+    .all() as SyncConflictRow[];
+};
+
+export const resolveSyncConflict = (conflictId: string): boolean => {
+  const db = getLocalDb();
+  const result = db
+    .prepare(
+      `
+        UPDATE sync_conflicts
+        SET resolved_at = ?
+        WHERE conflict_id = ?
+      `
+    )
+    .run(nowIso(), conflictId);
+  return result.changes > 0;
 };
 
 const applyLocalChange = (change: SyncChangeRow): void => {
