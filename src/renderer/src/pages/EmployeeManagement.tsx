@@ -48,6 +48,7 @@ const EmployeeManagement: React.FC = () => {
   const [editingEmail, setEditingEmail] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [isOnline, setIsOnline] = useState<boolean>(() => navigator.onLine);
 
   const getEmployeeRoleLabel = (employee: Employee): string | undefined => {
     const roleNames =
@@ -65,6 +66,19 @@ const EmployeeManagement: React.FC = () => {
   useEffect(() => {
     fetchEmployees();
     fetchRoles();
+  }, []);
+
+  useEffect(() => {
+    const handleOnline = (): void => setIsOnline(true);
+    const handleOffline = (): void => setIsOnline(false);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
   }, []);
 
   const fetchEmployees = async (): Promise<void> => {
@@ -105,6 +119,11 @@ const EmployeeManagement: React.FC = () => {
 
       if (!currentUser?.tenantId) {
         alert(t("Tenant information is missing. Please log in again."));
+        return;
+      }
+
+      if (!isOnline && !isEditing) {
+        alert(t("Internet connection is required to add employees."));
         return;
       }
 
@@ -241,6 +260,11 @@ const EmployeeManagement: React.FC = () => {
             <h2 className="text-xl font-semibold mb-4 text-gray-900 dark:text-slate-100">
               {isEditing ? t("Edit Employee") : t("Add New Employee")}
             </h2>
+            {!isOnline && !isEditing && (
+              <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2 mb-4">
+                {t("Internet connection is required to add employees.")}
+              </p>
+            )}
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 <div>
@@ -362,7 +386,7 @@ const EmployeeManagement: React.FC = () => {
               <div className="flex flex-col sm:flex-row space-y-2 sm:space-y-0 sm:space-x-2">
                 <button
                   type="submit"
-                  disabled={loading}
+                  disabled={loading || (!isOnline && !isEditing)}
                   className="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-500 disabled:opacity-50 text-sm font-medium"
                 >
                   {loading ? t("Processing...") : isEditing ? t("Update") : t("Add")}{" "}

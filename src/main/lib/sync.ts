@@ -80,9 +80,7 @@ const PRIMARY_KEYS: Record<string, string[]> = {
   employee_roles: ["employee_id", "role_id"]
 };
 
-const DISALLOWED_FIELDS_BY_TABLE: Record<string, string[]> = {
-  products: ["stock_level"]
-};
+const DISALLOWED_FIELDS_BY_TABLE: Record<string, string[]> = {};
 
 const nowIso = (): string => new Date().toISOString();
 

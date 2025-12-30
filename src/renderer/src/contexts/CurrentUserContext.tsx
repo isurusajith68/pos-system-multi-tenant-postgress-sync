@@ -79,6 +79,46 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
     await setActiveSchema(null);
   };
 
+  const maybeClearLocalDbForTenantSwitch = async (
+    nextSchema: string | null,
+    nextTenantId?: string | null,
+    options?: { prompt?: boolean }
+  ): Promise<boolean> => {
+    if (!nextSchema) {
+      return true;
+    }
+
+    const lastSchema = await window.electron.ipcRenderer.invoke(
+      "localMeta:get",
+      "last_login_schema"
+    );
+    const lastTenant = await window.electron.ipcRenderer.invoke(
+      "localMeta:get",
+      "last_login_tenant"
+    );
+
+    const hasLocalData = await window.electron.ipcRenderer.invoke("localDb:hasData");
+
+    const schemaChanged = lastSchema && String(lastSchema) !== String(nextSchema);
+    const tenantChanged = nextTenantId && lastTenant && String(lastTenant) !== String(nextTenantId);
+    const missingLastLogin = !lastSchema || !lastTenant;
+
+   
+    if (schemaChanged || tenantChanged || (hasLocalData && missingLastLogin)) {
+      if (options?.prompt) {
+        const confirmed = window.confirm(
+          "Detected schema change. Local data may be cleared and missing. Are you sure?"
+        );
+        if (!confirmed) {
+          return false;
+        }
+      }
+      console.log("Clearing local SQLite for tenant switch");
+      await window.electron.ipcRenderer.invoke("localDb:clearForTenantSwitch");
+    }
+    return true;
+  };
+
   const attemptOfflineLogin = async (email: string, password: string): Promise<boolean> => {
     const normalizedEmail = email.trim().toLowerCase();
     const cached = await window.electron.ipcRenderer.invoke(
@@ -182,6 +222,7 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
     setIsLoading(true);
     try {
       const normalizedEmail = email.trim().toLowerCase();
+      console.log("Login attempt email:", normalizedEmail);
       if (!navigator.onLine) {
         return await attemptOfflineLogin(normalizedEmail, password);
       }
@@ -193,7 +234,7 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
         "tenantUsers:findByEmail",
         normalizedEmail
       );
-      console.log(tenantUser);
+
       if (!tenantUser) {
         console.log("No tenant user found for email:", email);
         toast.error("Invalid email or password");
@@ -232,6 +273,13 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
       if (!schemaName) {
         console.error("No schema name found for tenant user");
         toast.error("System configuration error. Please contact support.");
+        return false;
+      }
+
+      const proceed = await maybeClearLocalDbForTenantSwitch(schemaName, tenantUser.tenantId, {
+        prompt: true
+      });
+      if (!proceed) {
         return false;
       }
 
@@ -333,12 +381,11 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
     const email = currentUser?.email;
     setCurrentUser(null);
     if (email) {
-      void window.electron.ipcRenderer.invoke("credentialCache:deleteByEmail", email).catch((error) => {
-        console.error("Failed to clear credential cache:", error);
-      });
-      void window.electron.ipcRenderer.invoke("localMeta:delete", "last_login_email");
-      void window.electron.ipcRenderer.invoke("localMeta:delete", "last_login_schema");
-      void window.electron.ipcRenderer.invoke("localMeta:delete", "last_login_tenant");
+      void window.electron.ipcRenderer
+        .invoke("credentialCache:deleteByEmail", email)
+        .catch((error) => {
+          console.error("Failed to clear credential cache:", error);
+        });
     }
     void clearActiveSchema().catch((error) => {
       console.error("Failed to clear active schema on logout:", error);
@@ -408,6 +455,8 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
               await clearActiveSchema();
               return;
             }
+
+            await maybeClearLocalDbForTenantSwitch(schemaName, tenantId);
 
             await setActiveSchema(schemaName, { skipTenantLookup: !navigator.onLine });
             if (tenantId) {

@@ -76,6 +76,9 @@ interface Window {
       syncProductStockFromInventory: (productId: string) => Promise<any>;
       syncAllProductsStockFromInventory: () => Promise<any>;
     };
+    sync: {
+      getStatus: () => Promise<{ state: "idle" | "syncing" | "error" | "offline"; error: string | null }>;
+    };
     suppliers: {
       findMany: () => Promise<any[]>;
       create: (data: any) => Promise<any>;

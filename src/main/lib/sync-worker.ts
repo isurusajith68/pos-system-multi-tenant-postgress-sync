@@ -10,6 +10,29 @@ let lastError: string | null = null;
 let timer: NodeJS.Timeout | null = null;
 let backoffMs = DEFAULT_BASE_INTERVAL_MS;
 
+const isConnectionError = (error: unknown): boolean => {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : error && typeof (error as { message?: unknown }).message === "string"
+          ? String((error as { message?: unknown }).message)
+          : "";
+
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("can't reach database server") ||
+    normalized.includes("server has closed the connection") ||
+    normalized.includes("connectionreset") ||
+    normalized.includes("econnreset") ||
+    normalized.includes("connection was forcibly closed") ||
+    normalized.includes("connection refused") ||
+    normalized.includes("connect timeout") ||
+    normalized.includes("timeout")
+  );
+};
+
 const scheduleNext = (delayMs: number): void => {
   if (timer) {
     clearTimeout(timer);
@@ -35,9 +58,12 @@ const runCycle = async (): Promise<void> => {
     currentState = "idle";
     backoffMs = DEFAULT_BASE_INTERVAL_MS;
   } catch (error) {
-    currentState = "error";
+    const connectionError = isConnectionError(error);
+    currentState = connectionError ? "offline" : "error";
     lastError = error instanceof Error ? error.message : String(error);
-    backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+    backoffMs = connectionError
+      ? DEFAULT_BASE_INTERVAL_MS
+      : Math.min(backoffMs * 2, MAX_BACKOFF_MS);
   } finally {
     scheduleNext(backoffMs);
   }

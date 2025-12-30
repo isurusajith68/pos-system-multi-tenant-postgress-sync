@@ -308,6 +308,9 @@ const api = {
     syncAllProductsStockFromInventory: () =>
       ipcRenderer.invoke("stockSync:syncAllProductsStockFromInventory")
   },
+  sync: {
+    getStatus: () => ipcRenderer.invoke("sync:status")
+  },
   suppliers: {
     findMany: () => ipcRenderer.invoke("suppliers:findMany"),
     create: (data: SupplierData) => ipcRenderer.invoke("suppliers:create", data),

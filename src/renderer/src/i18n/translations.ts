@@ -841,6 +841,8 @@ export const translations: Record<SupportedLanguage, TranslationDictionary> = {
     // Employee Management
     "Please fill in all required fields": "Please fill in all required fields",
     "Password is required for new employees": "Password is required for new employees",
+    "Internet connection is required to add employees.":
+      "Internet connection is required to add employees.",
     "Error saving employee. Please try again.": "Error saving employee. Please try again.",
     "Are you sure you want to delete this employee?":
       "Are you sure you want to delete this employee?",
@@ -1800,6 +1802,8 @@ export const translations: Record<SupportedLanguage, TranslationDictionary> = {
     // Employee Management
     "Please fill in all required fields": "කරුණාකර සියලුම අවශ්‍ය ක්ෂේත්‍ර පුරවන්න",
     "Password is required for new employees": "නව සේවකයින් සඳහා මුරපදය අවශ්‍යයි",
+    "Internet connection is required to add employees.":
+      "Internet connection is required to add employees.",
     "Error saving employee. Please try again.":
       "සේවකයා සුරැකීමේ දෝෂයක්. කරුණාකර නැවත උත්සාහ කරන්න.",
     "Are you sure you want to delete this employee?":

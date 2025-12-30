@@ -41,6 +41,7 @@ import {
 import { getSyncStatus, startSyncWorker } from "./lib/sync-worker";
 // import { initializeDatabase } from "./lib/database-init"; // Disabled: Database initialization no longer needed
 import { getPrismaClient, setActiveSchema } from "./lib/prisma";
+import { clearLocalDb, hasLocalDbData } from "./lib/local-sqlite";
 // import { initializeDatabase } from "./lib/database-init";
 
 // Configure logging
@@ -468,6 +469,25 @@ app.whenReady().then(async () => {
       return await localMetaService.delete(key);
     } catch (error) {
       console.error("Error deleting local meta:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("localDb:clearForTenantSwitch", async () => {
+    try {
+      clearLocalDb({ preserveDeviceId: true });
+      return { success: true };
+    } catch (error) {
+      console.error("Error clearing local DB for tenant switch:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("localDb:hasData", async () => {
+    try {
+      return hasLocalDbData();
+    } catch (error) {
+      console.error("Error checking local DB data:", error);
       throw error;
     }
   });

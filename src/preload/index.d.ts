@@ -532,6 +532,9 @@ declare global {
         syncProductStockFromInventory: (productId: string) => Promise<number>;
         syncAllProductsStockFromInventory: () => Promise<number>;
       };
+      sync: {
+        getStatus: () => Promise<{ state: "idle" | "syncing" | "error" | "offline"; error: string | null }>;
+      };
       settings: {
         findMany: () => Promise<Setting[]>;
         findByKey: (key: string) => Promise<Setting | null>;

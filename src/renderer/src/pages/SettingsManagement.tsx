@@ -778,24 +778,6 @@ const SettingsManagement: React.FC = () => {
       description: "Download server changes to this device",
       type: "button",
       action: handleSyncIn
-    },
-    {
-      id: "syncBootstrap",
-      label: "Bootstrap",
-      description: "Initial full download when local database is empty",
-      type: "button",
-      action: async () => {
-        try {
-          setLoading(true);
-          await window.electron.ipcRenderer.invoke("sync:bootstrap");
-          toast.success(t("Bootstrap completed"));
-        } catch (error) {
-          console.error("Error running bootstrap:", error);
-          toast.error(t("Bootstrap failed"));
-        } finally {
-          setLoading(false);
-        }
-      }
     }
   ];
 

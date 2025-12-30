@@ -5,7 +5,6 @@ import { validateAndFormatQuantity } from "./quantityValidation";
 import { getLocalDb } from "./local-sqlite";
 import { ensureDeviceId, getTenantId } from "./sync";
 
-
 type PaginationOptions = {
   skip?: number;
   take?: number;
@@ -348,10 +347,7 @@ const mapPurchaseOrderItemRowFromDb = (
   };
 };
 
-const mapPurchaseOrderRowFromDb = (
-  row: any,
-  related?: { supplier?: any; items?: any[] }
-): any => {
+const mapPurchaseOrderRowFromDb = (row: any, related?: { supplier?: any; items?: any[] }): any => {
   if (!row) {
     return null;
   }
@@ -550,7 +546,6 @@ const updateLocalProductStockLevel = (productId: string, newStockLevel: number):
     `
   ).run(newStockLevel, nowIso(), productId);
 };
-
 
 // Centralized stock level update utility
 export const updateProductStockLevel = async (
@@ -2276,9 +2271,7 @@ export const credentialCacheService = {
   findByEmail: async (email: string) => {
     const db = getLocalDb();
     return (
-      db
-        .prepare("SELECT * FROM credential_cache WHERE LOWER(email) = LOWER(?)")
-        .get(email) ?? null
+      db.prepare("SELECT * FROM credential_cache WHERE LOWER(email) = LOWER(?)").get(email) ?? null
     );
   },
 
@@ -2292,11 +2285,31 @@ export const credentialCacheService = {
   }) => {
     const db = getLocalDb();
     const normalizedEmail = data.email.trim().toLowerCase();
-    const existing = db
+    const existingByUserId = db
+      .prepare("SELECT user_id FROM credential_cache WHERE user_id = ?")
+      .get(data.userId);
+    if (existingByUserId) {
+      db.prepare(
+        `
+          UPDATE credential_cache
+          SET email = ?, password_hash = ?, roles = ?, last_verified_at = ?, expires_at = ?, failed_attempts = 0
+          WHERE user_id = ?
+        `
+      ).run(
+        normalizedEmail,
+        data.passwordHash,
+        data.roles ?? null,
+        data.lastVerifiedAt,
+        data.expiresAt,
+        data.userId
+      );
+      return;
+    }
+
+    const existingByEmail = db
       .prepare("SELECT user_id FROM credential_cache WHERE LOWER(email) = LOWER(?)")
       .get(normalizedEmail);
-
-    if (existing) {
+    if (existingByEmail) {
       db.prepare(
         `
           UPDATE credential_cache
@@ -2367,10 +2380,12 @@ export const credentialCacheService = {
 
 export const localMetaService = {
   get: async (key: string): Promise<string | null> => {
+    // console.log(key, "key");
     const db = getLocalDb();
     const row = db.prepare("SELECT value FROM local_meta WHERE key = ?").get(key) as
       | { value: string }
       | undefined;
+    // console.log(row);
     return row?.value ?? null;
   },
 
@@ -2464,9 +2479,7 @@ export const salesInvoiceService = {
           )
           .all(...employeeIds) as any[])
       : ([] as any[]);
-    const customerMap = new Map<string, any>(
-      customers.map((row: any) => [row.customer_id, row])
-    );
+    const customerMap = new Map<string, any>(customers.map((row: any) => [row.customer_id, row]));
     const employeeMap = new Map<string, any>(employees.map((row: any) => [row.id, row]));
 
     const invoiceIds = rows.map((row) => row.invoice_id);
@@ -3885,9 +3898,7 @@ export const inventoryService = {
     const categories = db
       .prepare("SELECT * FROM categories WHERE deleted_at IS NULL")
       .all() as any[];
-    const categoryMap = new Map<string, any>(
-      categories.map((cat: any) => [cat.category_id, cat])
-    );
+    const categoryMap = new Map<string, any>(categories.map((cat: any) => [cat.category_id, cat]));
 
     if (filters?.searchTerm) {
       const term = filters.searchTerm.trim().toLowerCase();
@@ -3945,7 +3956,7 @@ export const inventoryService = {
 
     return rows.map((row) => {
       const product = productMap.get(row.product_id);
-      const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+      const category = product?.category_id ? (categoryMap.get(product.category_id) ?? null) : null;
       return mapInventoryRowFromDb(row, { product, category });
     });
   },
@@ -4571,9 +4582,7 @@ export const stockTransactionService = {
     const categories = db
       .prepare("SELECT * FROM categories WHERE deleted_at IS NULL")
       .all() as any[];
-    const categoryMap = new Map<string, any>(
-      categories.map((cat: any) => [cat.category_id, cat])
-    );
+    const categoryMap = new Map<string, any>(categories.map((cat: any) => [cat.category_id, cat]));
 
     if (filters?.searchTerm) {
       const term = filters.searchTerm.trim().toLowerCase();
@@ -4613,7 +4622,7 @@ export const stockTransactionService = {
 
     return rows.map((row) => {
       const product = productMap.get(row.product_id);
-      const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+      const category = product?.category_id ? (categoryMap.get(product.category_id) ?? null) : null;
       return mapStockTransactionRowFromDb(row, { product, category });
     });
   },
@@ -5338,15 +5347,15 @@ export const purchaseOrderService = {
     const productMap = new Map<string, any>(
       products.map((product: any) => [product.product_id, product])
     );
-    const categoryMap = new Map<string, any>(
-      categories.map((cat: any) => [cat.category_id, cat])
-    );
+    const categoryMap = new Map<string, any>(categories.map((cat: any) => [cat.category_id, cat]));
 
     return rows.map((row) => {
       const supplier = supplierMap.get(row.supplier_id) ?? null;
       const items = (itemMap.get(row.po_id) ?? []).map((item) => {
         const product = item.product_id ? productMap.get(item.product_id) : null;
-        const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+        const category = product?.category_id
+          ? (categoryMap.get(product.category_id) ?? null)
+          : null;
         return mapPurchaseOrderItemRowFromDb(item, { product, category });
       });
       return mapPurchaseOrderRowFromDb(row, {
@@ -5536,15 +5545,15 @@ export const purchaseOrderService = {
     const productMap = new Map<string, any>(
       products.map((product: any) => [product.product_id, product])
     );
-    const categoryMap = new Map<string, any>(
-      categories.map((cat: any) => [cat.category_id, cat])
-    );
+    const categoryMap = new Map<string, any>(categories.map((cat: any) => [cat.category_id, cat]));
 
     return mapPurchaseOrderRowFromDb(row, {
       supplier,
       items: items.map((item) => {
         const product = item.product_id ? productMap.get(item.product_id) : null;
-        const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+        const category = product?.category_id
+          ? (categoryMap.get(product.category_id) ?? null)
+          : null;
         return mapPurchaseOrderItemRowFromDb(item, { product, category });
       })
     });
@@ -5636,15 +5645,15 @@ export const purchaseOrderService = {
     const productMap = new Map<string, any>(
       products.map((product: any) => [product.product_id, product])
     );
-    const categoryMap = new Map<string, any>(
-      categories.map((cat: any) => [cat.category_id, cat])
-    );
+    const categoryMap = new Map<string, any>(categories.map((cat: any) => [cat.category_id, cat]));
 
     return mapPurchaseOrderRowFromDb(po, {
       supplier,
       items: items.map((item) => {
         const product = item.product_id ? productMap.get(item.product_id) : null;
-        const category = product?.category_id ? categoryMap.get(product.category_id) ?? null : null;
+        const category = product?.category_id
+          ? (categoryMap.get(product.category_id) ?? null)
+          : null;
         return mapPurchaseOrderItemRowFromDb(item, { product, category });
       })
     });

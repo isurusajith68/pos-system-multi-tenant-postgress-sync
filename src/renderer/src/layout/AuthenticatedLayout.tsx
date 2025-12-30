@@ -23,11 +23,47 @@ const AuthenticatedLayout: React.FC<AuthenticatedLayoutProps> = ({ children }) =
   const { settings } = useAppData();
   const [currentPage, setCurrentPage] = useState("pos");
   const [showProfileDropdown, setShowProfileDropdown] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<{
+    state: "idle" | "syncing" | "error" | "offline";
+    error: string | null;
+  }>({ state: "offline", error: null });
+
   useEffect(() => {
     const root = document.documentElement;
     root.classList.toggle("dark", settings.darkMode);
     localStorage.setItem("theme", settings.darkMode ? "dark" : "light");
   }, [settings.darkMode]);
+
+  useEffect(() => {
+    let isActive = true;
+
+    const fetchStatus = async (): Promise<void> => {
+      if (!window.api?.sync?.getStatus) {
+        return;
+      }
+      try {
+        const status = await window.api.sync.getStatus();
+        if (isActive && status) {
+          setSyncStatus(status);
+        }
+      } catch (error) {
+        if (isActive) {
+          setSyncStatus({
+            state: "error",
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+    };
+
+    void fetchStatus();
+    const interval = setInterval(fetchStatus, 5000);
+
+    return () => {
+      isActive = false;
+      clearInterval(interval);
+    };
+  }, []);
 
   const getNavButtonClass = (isActive: boolean) =>
     `px-2 sm:px-3 lg:px-4 py-1.5 sm:py-2 rounded-lg font-medium transition-colors text-sm sm:text-sm ${
@@ -35,6 +71,33 @@ const AuthenticatedLayout: React.FC<AuthenticatedLayoutProps> = ({ children }) =
         ? "bg-white text-blue-600 dark:bg-slate-900 dark:text-blue-300 border border-white/50 dark:border-slate-700 shadow-sm"
         : "bg-blue-500 dark:bg-slate-800 hover:bg-blue-400 dark:hover:bg-slate-700 text-white"
     }`;
+
+  const syncLabel =
+    syncStatus.state === "idle"
+      ? "In Sync"
+      : syncStatus.state === "syncing"
+        ? "Syncing"
+        : syncStatus.state === "offline"
+          ? "Offline"
+          : "Sync Error";
+
+  const syncBadgeClass =
+    syncStatus.state === "idle"
+      ? "bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-200 dark:border-emerald-800"
+      : syncStatus.state === "syncing"
+        ? "bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900/40 dark:text-amber-200 dark:border-amber-800"
+        : syncStatus.state === "offline"
+          ? "bg-gray-200 text-gray-700 border-gray-300 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-700"
+          : "bg-red-100 text-red-800 border-red-200 dark:bg-red-900/40 dark:text-red-200 dark:border-red-800";
+
+  const syncDotClass =
+    syncStatus.state === "idle"
+      ? "bg-emerald-600"
+      : syncStatus.state === "syncing"
+        ? "bg-amber-600"
+        : syncStatus.state === "offline"
+          ? "bg-gray-600"
+          : "bg-red-600";
 
   const renderPage = () => {
     switch (currentPage) {
@@ -160,17 +223,19 @@ const AuthenticatedLayout: React.FC<AuthenticatedLayoutProps> = ({ children }) =
           <div className="flex items-center space-x-4 mt-2 sm:mt-0">
             <div className="relative z-10">
               <div className="flex items-center gap-5">
-                <div className="text-right leading-tight">
+                <div className="text-right leading-tight flex flex-col gap-1">
                   <h3 className="font-bold text-base text-white capitalize tracking-wide px-1">
                     {user?.companyName}
                   </h3>
-                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-medium bg-blue-100 text-blue-800 border border-blue-200 dark:bg-blue-900/40 dark:text-blue-200 dark:border-blue-800">
-                    {user?.role}
-                  </span>
+                  <div
+                    className={`inline-flex items-center gap-2 px-2.5 py-0.5 rounded-full text-[10px] font-medium border ${syncBadgeClass}`}
+                    title={syncStatus.error ? `Sync error: ${syncStatus.error}` : undefined}
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full ${syncDotClass}`}></span>
+                    <span>{`Sync: ${syncLabel}`}</span>
+                  </div>
                 </div>
-
                 <div className="h-8 w-px bg-white/20"></div>
-
                 <button
                   onClick={() => setShowProfileDropdown(!showProfileDropdown)}
                   className="group relative flex items-center justify-center w-8 h-8 rounded-full
