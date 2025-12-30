@@ -53,7 +53,7 @@ interface CurrentUserProviderProps {
 export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<Employee | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const sessionTtlMs = 24 * 60 * 60 * 1000;
+  const sessionTtlMs = 24 * 60 * 60 * 1000; //1 day
 
   const isAuthenticated = currentUser !== null;
 
@@ -68,8 +68,11 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
     );
   };
 
-  const setActiveSchema = async (schemaName: string | null) => {
-    await window.electron.ipcRenderer.invoke("tenants:setActiveSchema", schemaName);
+  const setActiveSchema = async (
+    schemaName: string | null,
+    options?: { skipTenantLookup?: boolean }
+  ) => {
+    await window.electron.ipcRenderer.invoke("tenants:setActiveSchema", schemaName, options);
   };
 
   const clearActiveSchema = async () => {
@@ -144,13 +147,15 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
 
     if (
       !storedUser?.schemaName ||
-      String(storedUser.email ?? "").trim().toLowerCase() !== normalizedEmail
+      String(storedUser.email ?? "")
+        .trim()
+        .toLowerCase() !== normalizedEmail
     ) {
       toast.error("Offline login requires a previous online login.");
       return false;
     }
 
-    await setActiveSchema(storedUser.schemaName);
+    await setActiveSchema(storedUser.schemaName, { skipTenantLookup: true });
     if (storedUser.tenantId) {
       await window.electron.ipcRenderer.invoke("sync:setTenant", storedUser.tenantId);
     }
@@ -285,7 +290,11 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
           lastVerifiedAt: nowIso,
           expiresAt
         });
-        await window.electron.ipcRenderer.invoke("localMeta:set", "last_login_email", normalizedEmail);
+        await window.electron.ipcRenderer.invoke(
+          "localMeta:set",
+          "last_login_email",
+          normalizedEmail
+        );
         await window.electron.ipcRenderer.invoke("localMeta:set", "last_login_schema", schemaName);
         await window.electron.ipcRenderer.invoke(
           "localMeta:set",
@@ -321,7 +330,16 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
   };
 
   const logout = () => {
+    const email = currentUser?.email;
     setCurrentUser(null);
+    if (email) {
+      void window.electron.ipcRenderer.invoke("credentialCache:deleteByEmail", email).catch((error) => {
+        console.error("Failed to clear credential cache:", error);
+      });
+      void window.electron.ipcRenderer.invoke("localMeta:delete", "last_login_email");
+      void window.electron.ipcRenderer.invoke("localMeta:delete", "last_login_schema");
+      void window.electron.ipcRenderer.invoke("localMeta:delete", "last_login_tenant");
+    }
     void clearActiveSchema().catch((error) => {
       console.error("Failed to clear active schema on logout:", error);
     });
@@ -363,7 +381,10 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
                 "localMeta:get",
                 "last_login_email"
               );
-              if (lastEmail && String(lastEmail).toLowerCase() === String(user.email).toLowerCase()) {
+              if (
+                lastEmail &&
+                String(lastEmail).toLowerCase() === String(user.email).toLowerCase()
+              ) {
                 schemaName = lastSchema ?? null;
                 tenantId = lastTenant ?? tenantId;
               }
@@ -388,7 +409,7 @@ export const CurrentUserProvider: React.FC<CurrentUserProviderProps> = ({ childr
               return;
             }
 
-            await setActiveSchema(schemaName);
+            await setActiveSchema(schemaName, { skipTenantLookup: !navigator.onLine });
             if (tenantId) {
               await window.electron.ipcRenderer.invoke("sync:setTenant", tenantId);
             }

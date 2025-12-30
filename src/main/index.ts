@@ -436,6 +436,15 @@ app.whenReady().then(async () => {
     }
   });
 
+  ipcMain.handle("credentialCache:deleteByEmail", async (_, email) => {
+    try {
+      return await credentialCacheService.deleteByEmail(email);
+    } catch (error) {
+      console.error("Error deleting credential cache entry:", error);
+      throw error;
+    }
+  });
+
   ipcMain.handle("localMeta:get", async (_, key) => {
     try {
       return await localMetaService.get(key);
@@ -450,6 +459,15 @@ app.whenReady().then(async () => {
       return await localMetaService.set(key, value);
     } catch (error) {
       console.error("Error writing local meta:", error);
+      throw error;
+    }
+  });
+
+  ipcMain.handle("localMeta:delete", async (_, key) => {
+    try {
+      return await localMetaService.delete(key);
+    } catch (error) {
+      console.error("Error deleting local meta:", error);
       throw error;
     }
   });
@@ -1710,12 +1728,13 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle("tenants:setActiveSchema", async (_, schemaName) => {
+  ipcMain.handle("tenants:setActiveSchema", async (_, schemaName, options) => {
     try {
       const normalizedSchema =
         typeof schemaName === "string" && schemaName.trim().length > 0 ? schemaName : null;
+      const skipTenantLookup = Boolean(options?.skipTenantLookup);
       setActiveSchema(normalizedSchema);
-      if (normalizedSchema) {
+      if (normalizedSchema && !skipTenantLookup) {
         const { tenantService } = await import("./lib/database");
         const { setTenantId } = await import("./lib/sync");
         const tenant = await tenantService.findBySchemaName(normalizedSchema);

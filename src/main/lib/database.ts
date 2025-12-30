@@ -2340,6 +2340,11 @@ export const credentialCacheService = {
         WHERE LOWER(email) = LOWER(?)
       `
     ).run(email);
+  },
+
+  deleteByEmail: async (email: string) => {
+    const db = getLocalDb();
+    db.prepare("DELETE FROM credential_cache WHERE LOWER(email) = LOWER(?)").run(email);
   }
 };
 
@@ -2361,6 +2366,11 @@ export const localMetaService = {
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       `
     ).run(key, value);
+  },
+
+  delete: async (key: string): Promise<void> => {
+    const db = getLocalDb();
+    db.prepare("DELETE FROM local_meta WHERE key = ?").run(key);
   }
 };
 

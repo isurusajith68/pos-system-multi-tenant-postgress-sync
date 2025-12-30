@@ -110,5 +110,5 @@ compression: maximum
 publish:
   provider: github
   owner: isurusajith68
-  repo: pos-system-multi-tenant-postgress
+  repo: pos-system-multi-tenant-postgress-sync
   private: false

@@ -1,14 +1,14 @@
 {
-  "name": "zentra-pos-multi-tenant",
+  "name": "zentra-pos-multi-tenant-sync",
   "version": "1.0.4",
   "description": "Zentra - A modern Point of Sale (POS) system built with Electron, React, and TypeScript",
   "main": "./out/main/index.js",
   "author": "isurusajith",
-  "homepage": "https://github.com/isurusajith68/pos-system-multi-tenant-postgress.git",
+  "homepage": "https://github.com/isurusajith68/pos-system-multi-tenant-postgress-sync.git",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/isurusajith68/pos-system-multi-tenant-postgress.git"
+    "url": "https://github.com/isurusajith68/pos-system-multi-tenant-postgress-sync.git"
   },
   "keywords": [
     "pos",
