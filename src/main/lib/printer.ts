@@ -114,7 +114,7 @@ export const printerService = {
 
       printWindow.show();
       printWindow.focus();
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
 
       const printOptions: any = {
         preview: false,

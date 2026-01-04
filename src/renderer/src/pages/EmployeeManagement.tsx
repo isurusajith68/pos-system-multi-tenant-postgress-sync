@@ -50,6 +50,14 @@ const EmployeeManagement: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [isOnline, setIsOnline] = useState<boolean>(() => navigator.onLine);
 
+  const formatJoinedDate = (value: Date | string | null | undefined): string => {
+    if (!value) {
+      return "-";
+    }
+    const parsed = value instanceof Date ? value : new Date(value);
+    return Number.isNaN(parsed.getTime()) ? "-" : parsed.toLocaleDateString();
+  };
+
   const getEmployeeRoleLabel = (employee: Employee): string | undefined => {
     const roleNames =
       employee.employeeRoles
@@ -440,7 +448,7 @@ const EmployeeManagement: React.FC = () => {
                     )}
                     <p className="text-xs text-gray-600">
                       <span className="font-medium">{t("Joined:")}</span>{" "}
-                      {new Date(employee.createdAt).toLocaleDateString()}
+                      {formatJoinedDate(employee.createdAt)}
                     </p>
                   </div>
                   <div className="flex space-x-2">
@@ -518,7 +526,7 @@ const EmployeeManagement: React.FC = () => {
                         {employee.address || "-"}
                       </td>
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-slate-100">
-                        {new Date(employee.createdAt).toLocaleDateString()}
+                        {formatJoinedDate(employee.createdAt)}
                       </td>
                       <td className="px-4 py-3 text-sm space-x-2">
                         <button

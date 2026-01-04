@@ -2239,9 +2239,6 @@ const POSSystem2: React.FC = () => {
             >
               Clear
             </button>
-
-           
-
             <button
               type="button"
               onClick={openPaymentConfirmation}
