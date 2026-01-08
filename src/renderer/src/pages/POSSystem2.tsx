@@ -343,10 +343,6 @@ const POSSystem2: React.FC = () => {
           duration: 3000,
           position: "top-center"
         });
-
-        if (!searchTerm.trim()) {
-          setSearchTerm(scannedCode);
-        }
       } catch (error) {
         console.error("Error searching products:", error);
         toast.error(t("pos.toast.productsLoadFailed"));

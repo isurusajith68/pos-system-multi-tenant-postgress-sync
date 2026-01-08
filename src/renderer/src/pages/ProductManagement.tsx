@@ -857,7 +857,9 @@ const ProductManagement: React.FC = () => {
             {t("Product Management")}
           </h1>
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between">
-            <p className="text-gray-600 dark:text-slate-400">{t("Manage your product catalog and inventory")}</p>
+            <p className="text-gray-600 dark:text-slate-400">
+              {t("Manage your product catalog and inventory")}
+            </p>
             {totalProducts > 0 && (
               <div className="text-sm text-gray-500 dark:text-slate-400 mt-1 sm:mt-0">
                 {hasActiveFilters
@@ -885,7 +887,9 @@ const ProductManagement: React.FC = () => {
           <div className="bg-white dark:bg-slate-900 p-4 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm text-gray-600 dark:text-slate-400">{t("Total Inventory Value")}</p>
+                <p className="text-sm text-gray-600 dark:text-slate-400">
+                  {t("Total Inventory Value")}
+                </p>
                 <p className="text-xl font-bold text-green-600">Rs {stats.totalValue.toFixed(2)}</p>
               </div>
               <div className="text-2xl">💰</div>
@@ -920,7 +924,9 @@ const ProductManagement: React.FC = () => {
         <div className="bg-white dark:bg-slate-900 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 p-4 mb-6">
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4">
             <div className="lg:col-span-2">
-              <label className="block text-sm font-medium text-gray-700 dark:text-slate-200 mb-1">{t("Search")}</label>
+              <label className="block text-sm font-medium text-gray-700 dark:text-slate-200 mb-1">
+                {t("Search")}
+              </label>
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -1101,13 +1107,19 @@ const ProductManagement: React.FC = () => {
               <tbody className="bg-white dark:bg-slate-900 divide-y divide-gray-200">
                 {loading ? (
                   <tr>
-                    <td colSpan={8} className="px-4 py-8 text-center text-gray-500 dark:text-slate-400">
+                    <td
+                      colSpan={8}
+                      className="px-4 py-8 text-center text-gray-500 dark:text-slate-400"
+                    >
                       {t("Loading products...")}
                     </td>
                   </tr>
                 ) : products.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="px-4 py-8 text-center text-gray-500 dark:text-slate-400">
+                    <td
+                      colSpan={8}
+                      className="px-4 py-8 text-center text-gray-500 dark:text-slate-400"
+                    >
                       <div className="text-4xl mb-2">📦</div>
                       <p>{t("No products found")}</p>
                       <p className="text-sm text-gray-400 mt-1">
@@ -1141,7 +1153,9 @@ const ProductManagement: React.FC = () => {
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-slate-100">
                         {product.category?.name || t("Uncategorized")}
                       </td>
-                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-slate-100">{product.unit || "-"}</td>
+                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-slate-100">
+                        {product.unit || "-"}
+                      </td>
                       <td className="px-4 py-3 text-sm font-bold text-right">
                         <div className="text-green-600">Rs {product.price.toFixed(2)}</div>
                         {product.discountedPrice && product.discountedPrice > 0 && (
@@ -1283,7 +1297,7 @@ const ProductManagement: React.FC = () => {
 
                       <div>
                         <label className="block text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">
-                          {t("English Name")}
+                          {t("Item Code")} or {t("English Name")}
                         </label>
                         <input
                           type="text"
@@ -1292,10 +1306,12 @@ const ProductManagement: React.FC = () => {
                             setFormData({ ...formData, englishName: e.target.value })
                           }
                           className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-                            errors.englishName ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                            errors.englishName
+                              ? "border-red-500"
+                              : "border-gray-300 dark:border-slate-700"
                           }`}
                           disabled={loading}
-                          placeholder={t("Enter English name")}
+                          placeholder={t("Enter English name or Item Code")}
                         />
                         {errors.englishName && (
                           <p className="mt-1 text-xs text-red-600">{errors.englishName}</p>
@@ -1317,7 +1333,9 @@ const ProductManagement: React.FC = () => {
                             onFocus={() => setIsCategoryDropdownOpen(true)}
                             placeholder={t("Search or select a category")}
                             className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-                              errors.categoryId ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                              errors.categoryId
+                                ? "border-red-500"
+                                : "border-gray-300 dark:border-slate-700"
                             }`}
                             disabled={loading}
                             autoComplete="off"
@@ -1502,7 +1520,9 @@ const ProductManagement: React.FC = () => {
                                 setFormData({ ...formData, barcode: e.target.value })
                               }
                               className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-                                errors.barcode ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                                errors.barcode
+                                  ? "border-red-500"
+                                  : "border-gray-300 dark:border-slate-700"
                               } ${isScanningBarcode ? "ring-2 ring-green-400 border-green-400" : ""}`}
                               disabled={loading}
                               placeholder={t("Enter barcode number")}
@@ -1556,7 +1576,9 @@ const ProductManagement: React.FC = () => {
                           {t("Cost Price *")}
                         </label>
                         <div className="relative">
-                          <span className="absolute left-3 top-2 text-gray-500 dark:text-slate-400 text-sm">Rs</span>
+                          <span className="absolute left-3 top-2 text-gray-500 dark:text-slate-400 text-sm">
+                            Rs
+                          </span>
                           <input
                             type="number"
                             step="0.01"
@@ -1573,7 +1595,9 @@ const ProductManagement: React.FC = () => {
                               e.currentTarget.blur();
                             }}
                             className={`w-full pl-8 pr-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [-moz-appearance:textfield] ${
-                              errors.costPrice ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                              errors.costPrice
+                                ? "border-red-500"
+                                : "border-gray-300 dark:border-slate-700"
                             }`}
                             disabled={loading}
                             placeholder="0.00"
@@ -1592,7 +1616,9 @@ const ProductManagement: React.FC = () => {
                           {t("Regular Price *")}
                         </label>
                         <div className="relative">
-                          <span className="absolute left-3 top-2 text-gray-500 dark:text-slate-400 text-sm">Rs</span>
+                          <span className="absolute left-3 top-2 text-gray-500 dark:text-slate-400 text-sm">
+                            Rs
+                          </span>
                           <input
                             type="number"
                             step="0.01"
@@ -1605,7 +1631,9 @@ const ProductManagement: React.FC = () => {
                               e.currentTarget.blur();
                             }}
                             className={`w-full pl-8 pr-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [-moz-appearance:textfield] ${
-                              errors.price ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                              errors.price
+                                ? "border-red-500"
+                                : "border-gray-300 dark:border-slate-700"
                             }`}
                             required
                             disabled={loading}
@@ -1622,7 +1650,9 @@ const ProductManagement: React.FC = () => {
                           {t("Sale/Discounted Price")}
                         </label>
                         <div className="relative">
-                          <span className="absolute left-3 top-2 text-gray-500 dark:text-slate-400 text-sm">Rs</span>
+                          <span className="absolute left-3 top-2 text-gray-500 dark:text-slate-400 text-sm">
+                            Rs
+                          </span>
                           <input
                             type="number"
                             step="0.01"
@@ -1638,7 +1668,9 @@ const ProductManagement: React.FC = () => {
                               e.currentTarget.blur();
                             }}
                             className={`w-full pl-8 pr-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [-moz-appearance:textfield] ${
-                              errors.discountedPrice ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                              errors.discountedPrice
+                                ? "border-red-500"
+                                : "border-gray-300 dark:border-slate-700"
                             }`}
                             disabled={loading}
                             placeholder="0.00"
@@ -1657,7 +1689,9 @@ const ProductManagement: React.FC = () => {
                           {t("Wholesale")}
                         </label>
                         <div className="relative">
-                          <span className="absolute left-3 top-2 text-gray-500 dark:text-slate-400 text-sm">Rs</span>
+                          <span className="absolute left-3 top-2 text-gray-500 dark:text-slate-400 text-sm">
+                            Rs
+                          </span>
                           <input
                             type="number"
                             step="0.01"
@@ -1673,7 +1707,9 @@ const ProductManagement: React.FC = () => {
                               e.currentTarget.blur();
                             }}
                             className={`w-full pl-8 pr-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [-moz-appearance:textfield] ${
-                              errors.wholesale ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                              errors.wholesale
+                                ? "border-red-500"
+                                : "border-gray-300 dark:border-slate-700"
                             }`}
                             disabled={loading}
                             placeholder="0.00"
@@ -1704,12 +1740,16 @@ const ProductManagement: React.FC = () => {
                               e.currentTarget.blur();
                             }}
                             className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [-moz-appearance:textfield] ${
-                              errors.taxRate ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                              errors.taxRate
+                                ? "border-red-500"
+                                : "border-gray-300 dark:border-slate-700"
                             }`}
                             disabled={loading}
                             placeholder="0.00"
                           />
-                          <span className="absolute right-3 top-2 text-gray-500 dark:text-slate-400 text-sm">%</span>
+                          <span className="absolute right-3 top-2 text-gray-500 dark:text-slate-400 text-sm">
+                            %
+                          </span>
                         </div>
                         {errors.taxRate && (
                           <p className="mt-1 text-xs text-red-600">{errors.taxRate}</p>
@@ -1728,12 +1768,16 @@ const ProductManagement: React.FC = () => {
                         </h5>
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
                           <div className="flex justify-between">
-                            <span className="text-gray-600 dark:text-slate-400">{t("Regular Price:")}</span>
+                            <span className="text-gray-600 dark:text-slate-400">
+                              {t("Regular Price:")}
+                            </span>
                             <span className="font-medium">Rs {formData.price.toFixed(2)}</span>
                           </div>
                           {formData.discountedPrice > 0 && (
                             <div className="flex justify-between">
-                              <span className="text-gray-600 dark:text-slate-400">{t("Sale Price:")}</span>
+                              <span className="text-gray-600 dark:text-slate-400">
+                                {t("Sale Price:")}
+                              </span>
                               <span className="font-medium text-orange-600">
                                 Rs {formData.discountedPrice.toFixed(2)}
                               </span>
@@ -1741,7 +1785,9 @@ const ProductManagement: React.FC = () => {
                           )}
                           {formData.wholesale > 0 && (
                             <div className="flex justify-between">
-                              <span className="text-gray-600 dark:text-slate-400">{t("Wholesale:")}</span>
+                              <span className="text-gray-600 dark:text-slate-400">
+                                {t("Wholesale:")}
+                              </span>
                               <span className="font-medium text-indigo-600">
                                 Rs {formData.wholesale.toFixed(2)}
                               </span>
@@ -1808,7 +1854,9 @@ const ProductManagement: React.FC = () => {
                             e.currentTarget.blur();
                           }}
                           className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none [-moz-appearance:textfield] ${
-                            errors.stockLevel ? "border-red-500" : "border-gray-300 dark:border-slate-700"
+                            errors.stockLevel
+                              ? "border-red-500"
+                              : "border-gray-300 dark:border-slate-700"
                           }`}
                           disabled={loading}
                           placeholder={t("Enter stock quantity")}
