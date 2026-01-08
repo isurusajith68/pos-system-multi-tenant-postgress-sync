@@ -216,20 +216,20 @@ const SettingsManagement: React.FC = () => {
     [changeLanguage]
   );
 
-  const loadPrinters = useCallback(async (): Promise<void> => {
+  const loadPrinters = useCallback(async (selectedPrinter?: string): Promise<void> => {
     try {
       const availablePrinters = await window.api.printer.getPrinters();
       setPrinters(availablePrinters);
 
       if (availablePrinters.length > 0) {
-        // Check if current selectedPrinter is valid
-        const isCurrentPrinterValid = availablePrinters.some(
-          (p) => p.name === settings.selectedPrinter
-        );
+        const currentSelected = selectedPrinter ?? settings.selectedPrinter;
+        const isCurrentPrinterValid = currentSelected
+          ? availablePrinters.some((p) => p.name === currentSelected)
+          : true;
 
-        if (!settings.selectedPrinter || !isCurrentPrinterValid) {
+        if (currentSelected && !isCurrentPrinterValid) {
           // If current printer is invalid, delete the setting and select first available
-          if (settings.selectedPrinter && !isCurrentPrinterValid) {
+          if (!isCurrentPrinterValid) {
             await window.api.settings.delete("selectedPrinter");
           }
           updateSetting("selectedPrinter", availablePrinters[0].name);
@@ -387,16 +387,18 @@ const SettingsManagement: React.FC = () => {
     }
   };
 
-  const loadSettings = async (): Promise<void> => {
+  const loadSettings = async (): Promise<SettingsState | null> => {
     try {
       setLoading(true);
       const dbSettings: SettingRecord[] = await window.api.settings.findMany();
       const settingsObj = applySettingsRecords(dbSettings, DEFAULT_SETTINGS);
       setSettings(settingsObj);
       setAppSettings(settingsObj);
+      return settingsObj;
     } catch (error) {
       console.error("Error loading settings:", error);
       toast.error(t("Failed to load settings"));
+      return null;
     } finally {
       setLoading(false);
     }
@@ -1331,12 +1333,16 @@ const SettingsManagement: React.FC = () => {
   };
 
   useEffect(() => {
-    loadSettings();
-    loadBackupStats();
-    loadPrinters();
-    loadScanners();
-    loadRoles();
-    loadPermissions();
+    const initializeSettings = async (): Promise<void> => {
+      const loadedSettings = await loadSettings();
+      await loadBackupStats();
+      await loadPrinters(loadedSettings?.selectedPrinter);
+      await loadScanners();
+      await loadRoles();
+      await loadPermissions();
+    };
+
+    void initializeSettings();
     // We intentionally run this effect only once on mount to prevent reloading
     // settings on every dependency change which can overwrite unsaved edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps

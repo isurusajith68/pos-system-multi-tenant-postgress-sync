@@ -36,13 +36,6 @@ export interface ReceiptData {
   footer?: string;
 }
 
-// Configured printer device information
-const CONFIGURED_PRINTER = {
-  name: "EPSON TM-T82 Receipt", // Use EPSON TM-T82 Receipt as default
-  displayName: "EPSON TM-T82 Receipt",
-  isDefault: true
-};
-
 export const printerService = {
   getPrinters: async (): Promise<
     Array<{ name: string; displayName: string; isDefault: boolean }>
@@ -50,26 +43,18 @@ export const printerService = {
     try {
       const printers = await webContents.getFocusedWebContents()?.getPrintersAsync();
 
-      let result: Array<{ name: string; displayName: string; isDefault: boolean }> = [];
-
-      if (printers) {
-        result = printers.map((printer) => ({
-          name: printer.name,
-          displayName: printer.displayName || printer.name,
-          isDefault: false
-        }));
+      if (!printers) {
+        return [];
       }
 
-      const configuredExists = result.some((p) => p.name === CONFIGURED_PRINTER.name);
-      if (!configuredExists) {
-        result.unshift(CONFIGURED_PRINTER); // Add at the beginning as default
-      }
-
-      return result;
+      return printers.map((printer) => ({
+        name: printer.name,
+        displayName: printer.displayName || printer.name,
+        isDefault: false
+      }));
     } catch (error) {
       console.error("Error getting printers:", error);
-      // Return at least the configured printer
-      return [CONFIGURED_PRINTER];
+      return [];
     }
   },
 
@@ -89,13 +74,11 @@ export const printerService = {
       };
       const printConfig = { ...defaultConfig, ...config };
 
-      const effectivePrinterName = printerName || CONFIGURED_PRINTER.name;
-
       const receiptHtml = generateReceiptHtml(receiptData);
 
       const printWindow = new BrowserWindow({
         show: false,
-        width: 302,
+        width: 298,
         height: 600,
         webPreferences: {
           nodeIntegration: false,
@@ -103,7 +86,7 @@ export const printerService = {
           offscreen: false
         },
 
-        frame: false,
+        frame: true,
         alwaysOnTop: true,
         skipTaskbar: true
       });
@@ -133,8 +116,8 @@ export const printerService = {
         }
       };
 
-      if (effectivePrinterName && effectivePrinterName !== "") {
-        printOptions.deviceName = effectivePrinterName;
+      if (printerName && printerName !== "") {
+        printOptions.deviceName = printerName;
       } else {
         // Using system default printer
       }

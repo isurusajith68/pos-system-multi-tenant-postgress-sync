@@ -6175,9 +6175,7 @@ export const settingsService = {
     const updatedSettings: SettingsRow[] = [];
 
     for (const setting of settings) {
-      const existing = db
-        .prepare("SELECT * FROM settings WHERE key = ? AND deleted_at IS NULL")
-        .get(setting.key);
+      const existing = db.prepare("SELECT * FROM settings WHERE key = ?").get(setting.key);
       const deviceId = ensureDeviceId();
       const timestamp = nowIso();
       if (existing) {
@@ -6189,6 +6187,7 @@ export const settingsService = {
           category: setting.category ?? existing.category ?? "general",
           description: setting.description ?? existing.description,
           version,
+          deleted_at: null,
           updated_at: timestamp,
           last_modified_by_device_id: deviceId
         };
@@ -6196,7 +6195,7 @@ export const settingsService = {
           `
             UPDATE settings
             SET value = ?, type = ?, category = ?, description = ?,
-                version = ?, updated_at = ?, last_modified_by_device_id = ?
+                version = ?, deleted_at = ?, updated_at = ?, last_modified_by_device_id = ?
             WHERE key = ?
           `
         ).run(
@@ -6205,6 +6204,7 @@ export const settingsService = {
           row.category,
           row.description,
           row.version,
+          row.deleted_at,
           row.updated_at,
           row.last_modified_by_device_id,
           row.key
