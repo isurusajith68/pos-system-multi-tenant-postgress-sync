@@ -78,14 +78,14 @@ export const printerService = {
 
       const printWindow = new BrowserWindow({
         show: false,
-        width: 298,
+        width: 302,
         height: 600,
+        center: true,
         webPreferences: {
           nodeIntegration: false,
           contextIsolation: true,
           offscreen: false
         },
-
         frame: true,
         alwaysOnTop: true,
         skipTaskbar: true
@@ -167,7 +167,7 @@ export const printerService = {
             unit: "ක්"
           },
           {
-            name: "පරීක්ෂණ භාණ්ඩය 2",
+            name: "පරීක්ෂණ භාණ්ඩය 2 පරීක්ෂණ භාණ්ඩය 2 පරීක්ෂණ භාණ්ඩය 2 පරීක්ෂණ භාණ්ඩය 2",
             quantity: 1,
             price: 1550.0,
             total: 1550.0,
@@ -239,7 +239,7 @@ function generateReceiptHtml(data: ReceiptData): string {
       <th style="text-align: left; padding: 2px;">අයිතමය</th>
     </tr>
     <tr style="border-bottom: 1px dashed #000;">
-       <th style="text-align: left; padding: 2px; width: 15%;">ප්‍රමාණය</th>
+       <th style="text-align: left; padding: 2px; width: 12%;">ප්‍රමාණය</th>
       <th style="text-align: right; padding: 2px; width: 30%;">සිල්ලර මිල</th>
       <th style="text-align: right; padding: 2px; width: 30%;">අපේ මිල</th>
       <th style="text-align: right; padding: 2px; width: 25%;">වටිනාකම</th>
@@ -257,7 +257,7 @@ function generateReceiptHtml(data: ReceiptData): string {
         </tr>
         <tr>
           <!-- Second row: qty + prices -->
-          <td style="text-align: left; padding: 2px; width: 15%;font-weight: bold;">
+          <td style="text-align: left; padding: 2px; width: 12%;font-weight: bold;">
             ${item.quantity} ${item.unit}
           </td>
           <td style="text-align: right; padding: 2px; width: 30%;font-weight: bold; ${item.originalPrice !== undefined && item.price < item.originalPrice ? "text-decoration: line-through;" : ""}">
