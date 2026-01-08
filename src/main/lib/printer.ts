@@ -124,12 +124,12 @@ export const printerService = {
           marginType: "custom" as const,
           top: 0,
           bottom: 0,
-          left: 2,
-          right: 2
+          left: 0,
+          right: 0
         },
         pageSize: {
-          width: 80000,
-          height: 297000
+          width: 72000,
+          height: 2970000
         }
       };
 
@@ -215,8 +215,17 @@ export const printerService = {
   }
 };
 function generateReceiptHtml(data: ReceiptData): string {
+  const Profit = data.items.reduce(
+    (total, i) => total + ((i.originalPrice || 0) - i.price) * i.quantity,
+    0
+  );
+
   return `
-    <div style="font-family: 'Courier New', monospace;font-weight: bold; font-size: 11px; max-width: 250px; margin: 0 auto; background: #fff; padding: 2px; line-height: 1.3;">
+    <style>
+      @page { size: 80mm auto; margin: 0; }
+      body { margin: 0; }
+    </style>
+    <div style="font-family: 'Courier New', monospace;font-weight: bold; font-size: 11px; width: 95%; margin: 0; background: #fff; padding: 0px; line-height: 1.3;">
       
       ${data.header ? `<div style="text-align: center; font-weight: bold; font-size: 20px; margin-bottom: 6px;">${data.header}</div>` : ""}
       ${data.storeAddress ? `<div style="text-align: center; font-size: 10px;">${data.storeAddress}</div>` : ""}
@@ -247,9 +256,9 @@ function generateReceiptHtml(data: ReceiptData): string {
       <th style="text-align: left; padding: 2px;">අයිතමය</th>
     </tr>
     <tr style="border-bottom: 1px dashed #000;">
-       <th style="text-align: left; padding: 2px; width: 25%;">ප්‍රමාණය</th>
-      <th style="text-align: right; padding: 2px; width: 25%;">සිල්ලර මිල</th>
-      <th style="text-align: right; padding: 2px; width: 25%;">අපේ මිල</th>
+       <th style="text-align: left; padding: 2px; width: 15%;">ප්‍රමාණය</th>
+      <th style="text-align: right; padding: 2px; width: 30%;">සිල්ලර මිල</th>
+      <th style="text-align: right; padding: 2px; width: 30%;">අපේ මිල</th>
       <th style="text-align: right; padding: 2px; width: 25%;">වටිනාකම</th>
     </tr>
   </thead>
@@ -265,13 +274,13 @@ function generateReceiptHtml(data: ReceiptData): string {
         </tr>
         <tr>
           <!-- Second row: qty + prices -->
-          <td style="text-align: left; padding: 2px; width: 25%;font-weight: bold;">
+          <td style="text-align: left; padding: 2px; width: 15%;font-weight: bold;">
             ${item.quantity} ${item.unit}
           </td>
-          <td style="text-align: right; padding: 2px; width: 25%;font-weight: bold; ${item.originalPrice !== undefined && item.price < item.originalPrice ? "text-decoration: line-through;" : ""}">
+          <td style="text-align: right; padding: 2px; width: 30%;font-weight: bold; ${item.originalPrice !== undefined && item.price < item.originalPrice ? "text-decoration: line-through;" : ""}">
             ${item.originalPrice ? `රු.${item.originalPrice.toFixed(2)}` : "රු.0.00"}
           </td>
-          <td style="text-align: right; padding: 2px; width: 25%;font-weight: bold;">
+          <td style="text-align: right; padding: 2px; width: 30%;font-weight: bold;">
             ${item.price ? `රු.${item.price.toFixed(2)}` : "රු.0.00"}
           </td>
           <td style="text-align: right; padding: 2px; width: 25%; font-weight: bold;">
@@ -299,8 +308,12 @@ function generateReceiptHtml(data: ReceiptData): string {
             : ""
         }
         <tr>
-          <td style="font-size: 12px; font-weight: bold;">මුළු ගෙවීම</td>
+          <td style="font-size: 12px; font-weight: bold;">ගෙවිය යුතු මුදල</td>
           <td style="text-align: right; font-size: 12px; font-weight: bold;">රු.${data.total.toFixed(2)}</td>
+        </tr>
+        <tr>
+          <td style="font-size: 12px; font-weight: bold;">ලැබූ ලාභය</td>
+          <td style="text-align: right; font-size: 12px; font-weight: bold;">රු.${Profit.toFixed(2)}</td>
         </tr>
         ${
           data.amountReceived
