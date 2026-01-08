@@ -125,7 +125,7 @@ const SalesInvoices: React.FC = () => {
   const [itemsPerPage, setItemsPerPage] = useState(10);
 
   // Sorting
-  const [sortField, setSortField] = useState<string>("date");
+  const [sortField, setSortField] = useState<string>("id");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
 
   const printerSettings = useMemo(
@@ -454,6 +454,21 @@ const SalesInvoices: React.FC = () => {
     );
   });
 
+  const getInvoiceNumberText = (id: string): string => {
+    if (!id) return "";
+    const match = id.match(/(\d+)(?!.*\d)/);
+    if (match) {
+      return match[1];
+    }
+    return id.length > 8 ? id.slice(-8) : id;
+  };
+
+  const getInvoiceNumberSortValue = (id: string): number | string => {
+    const invoiceNumberText = getInvoiceNumberText(id);
+    const numeric = Number(invoiceNumberText);
+    return Number.isNaN(numeric) ? invoiceNumberText : numeric;
+  };
+
   // Sort filtered invoices
   const sortedInvoices = [...filteredInvoices].sort((a, b) => {
     const getValue = (invoice: SalesInvoice, field: string): string | number => {
@@ -469,7 +484,7 @@ const SalesInvoices: React.FC = () => {
         case "paymentMode":
           return invoice.paymentMode;
         case "id":
-          return invoice.id;
+          return getInvoiceNumberSortValue(invoice.id);
         default:
           return "";
       }
@@ -1389,7 +1404,7 @@ Note: This report excludes ${invoices.length - validInvoices.length} invoices wi
                       }`}
                     >
                       <td className="px-4 py-3 text-sm font-medium text-gray-900 dark:text-slate-100">
-                        #{invoice.id}
+                        #{getInvoiceNumberText(invoice.id)}
                       </td>
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-slate-100">
                         <div>

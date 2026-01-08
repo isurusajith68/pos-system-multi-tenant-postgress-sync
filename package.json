@@ -1,6 +1,6 @@
 {
   "name": "zentra-pos-multi-tenant-sync",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Zentra - A modern Point of Sale (POS) system built with Electron, React, and TypeScript",
   "main": "./out/main/index.js",
   "author": "isurusajith",
