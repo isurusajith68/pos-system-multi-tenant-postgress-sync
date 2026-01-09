@@ -1,259 +1,111 @@
-# 🏪 Zentra POS System
+# Zentra POS System (Multi-tenant Sync)
 
-A comprehensive Point of Sale (POS) system built with **Electron**, **React**, **TypeScript**, and **SQLite**. This modern desktop application provides a complete solution for retail businesses with inventory management, sales tracking, employee management, and detailed reporting.
+Zentra is a desktop POS system built with Electron, React, and TypeScript. It runs offline-first on
+SQLite and syncs to a multi-tenant PostgreSQL backend with resumable push/pull loops.
 
-![Zentra POS](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
-![Electron](https://img.shields.io/badge/Electron-Latest-47848F)
-![React](https://img.shields.io/badge/React-18+-61DAFB)
-![TypeScript](https://img.shields.io/badge/TypeScript-5+-3178C6)
+## Features
 
-## ✨ Features
+- Offline-first sales and inventory with local SQLite storage
+- Multi-tenant PostgreSQL sync with resumable cursors and conflict tracking
+- Role-based access control, permissions, and employee management
+- POS checkout with discounts, taxes, and multiple payment modes
+- Products, categories, suppliers, purchase orders, and stock transactions
+- Customer profiles, loyalty tracking, and customer transactions
+- Reports for sales, inventory, and employee performance
+- License activation flow, backups, and configurable settings
+- Barcode scanner and receipt printer integrations
 
-### 🔐 **Authentication & Security**
+## Offline Sync Model
 
-- Secure employee login system
-- Password hashing with bcrypt
-- Role-based access control
-- Session management
+The sync design is documented in `docs/sqlite-postgres-sync-design.md`. Highlights:
 
-### 📦 **Product Management**
+- Local writes go to SQLite and are appended to `sync_outbox`
+- Push loop applies changes to PostgreSQL and records them in `sync_change_log`
+- Pull loop replays changes from PostgreSQL into SQLite using a cursor
+- Soft deletes and version checks prevent silent overwrites
+- Conflicts are tracked in `sync_conflicts` for UI resolution
 
-- Add, edit, and delete products
-- SKU and barcode support
-- Category organization
-- Stock level tracking
-- Price management with discount support
-- Product images and descriptions
+Local SQLite schema: `resources/sqlite-schema.sql`
 
-### 🏷️ **Category Management**
+## Project Structure
 
-- Hierarchical category structure
-- Parent-child category relationships
-- Easy category organization
-- Bulk category operations
+```
+pos-system-multi-tenant-postgress-sync/
+  src/
+    main/                 # Electron main process
+      index.ts            # Main entry point
+      lib/                # Database, sync, backup, printer/scanner utilities
+    preload/              # Preload scripts
+    renderer/             # React frontend
+      src/
+        pages/            # Screens (POS, products, reports, settings, etc.)
+        components/       # UI components
+        contexts/         # Auth, user, and app data contexts
+  prisma/
+    schema.prisma         # PostgreSQL schema (multi-tenant models)
+    migrations/           # Prisma migrations
+  resources/
+    sqlite-schema.sql     # Local SQLite schema
+  docs/
+    sqlite-postgres-sync-design.md
+```
 
-### 👥 **Employee Management**
-
-- Employee profiles and roles
-- Secure password management
-- Sales tracking per employee
-- Shift logging
-
-### 💰 **Point of Sale**
-
-- Real-time transaction processing
-- Multiple payment methods
-- Receipt generation
-- Customer information management
-- Discount and tax calculations
-
-### 📊 **Inventory Management**
-
-- Real-time stock tracking
-- Stock transaction history
-- Low stock alerts
-- Inventory adjustments
-- Purchase order management
-
-### 📈 **Sales & Reporting**
-
-- Daily, weekly, monthly sales reports
-- Employee performance tracking
-- Inventory reports
-- Customer insights
-- Revenue analytics
-
-### ⚙️ **Settings & Configuration**
-
-- Company information setup
-- System preferences
-- Database configuration
-- Backup and restore options
-
-## 🚀 Quick Start
+## Getting Started
 
 ### Prerequisites
 
-- **Node.js** (v16 or higher)
-- **npm** or **yarn**
-- **Git**
+- Node.js 18+
+- PostgreSQL 14+
 
-### Installation
+### Setup
 
-1. **Clone the repository**
+1. Install dependencies
 
-   ```bash
-   git clone https://github.com/isurusajith68/POS-System.git
-   cd POS-System
-   ```
-
-2. **Install dependencies**
-
-   ```bash
-   npm install
-   ```
-
-3. **Setup database**
-
-   ```bash
-   npx prisma migrate dev
-   npx prisma generate
-   ```
-
-4. **Start development server**
-   ```bash
-   npm run dev
-   ```
-
-### Default Login Credentials
-
-- **Email**: `admin@posystem.com`
-- **Password**: `admin123`
-
-## 🛠️ Development
-
-### **Available Scripts**
-
-| Command               | Description                              |
-| --------------------- | ---------------------------------------- |
-| `npm run dev`         | Start development server with hot reload |
-| `npm run build`       | Build the application for production     |
-| `npm run build:win`   | Build Windows executable (.exe)          |
-| `npm run build:mac`   | Build macOS application (.dmg)           |
-| `npm run build:linux` | Build Linux application (AppImage, deb)  |
-| `npm run typecheck`   | Run TypeScript type checking             |
-| `npm run lint`        | Run ESLint code linting                  |
-| `npm run format`      | Format code with Prettier                |
-
-### **Project Structure**
-
-```
-POS-System/
-├── src/
-│   ├── main/           # Electron main process
-│   │   ├── index.ts    # Main entry point
-│   │   └── lib/        # Database & utilities
-│   ├── preload/        # Preload scripts
-│   ├── renderer/       # React frontend
-│   │   └── src/
-│   │       ├── components/  # React components
-│   │       ├── contexts/    # React contexts
-│   │       └── assets/      # Styles & images
-│   └── generated/      # Prisma generated files
-├── prisma/
-│   ├── schema.prisma   # Database schema
-│   ├── migrations/     # Database migrations
-│   └── db/            # SQLite database file
-├── build/             # Build assets
-├── dist/              # Built applications
-└── resources/         # Application resources
+```bash
+npm install
 ```
 
-## 📱 Technologies Used
+2. Configure environment
 
-### **Frontend**
-
-- **React 18** - UI library
-- **TypeScript** - Type safety
-- **Tailwind CSS** - Styling
-- **React Hot Toast** - Notifications
-
-### **Backend**
-
-- **Electron** - Desktop app framework
-- **Prisma** - Database ORM
-- **SQLite** - Database
-- **bcrypt** - Password hashing
-
-### **Build Tools**
-
-- **Electron Vite** - Build tooling
-- **Electron Builder** - App packaging
-- **ESLint** - Code linting
-- **Prettier** - Code formatting
-
-## 📋 Database Schema
-
-The application uses **SQLite** with **Prisma ORM** for data management:
-
-- **Products** - Product information and inventory
-- **Categories** - Product categorization
-- **Employees** - User accounts and roles
-- **Sales** - Transaction records
-- **Customers** - Customer information
-- **Inventory** - Stock tracking
-- **Settings** - Application configuration
-
-## 🔧 Configuration
-
-### **Database Setup**
-
-The application automatically initializes the database on first run with:
-
-- Default admin user
-- Sample categories and products
-- Basic system settings
-
-### **Environment Variables**
-
-Create a `.env` file in the root directory:
+Create `.env` with your PostgreSQL connection string:
 
 ```env
-DATABASE_URL="file:./prisma/db/pos.db"
+DATABASE_URL="postgresql://user:password@localhost:5432/zentra"
 ```
 
-## 📦 Building for Production
-
-### **Windows**
+3. Apply migrations
 
 ```bash
-npm run build:win
+npx prisma migrate deploy
 ```
 
-Output: `dist/pos-1.0.0-setup.exe`
-
-### **macOS**
+4. Start the app
 
 ```bash
-npm run build:mac
+npm run dev
 ```
 
-Output: `dist/pos-1.0.0.dmg`
+### Default Admin (created on first init)
 
-### **Linux**
+- Email: `admin@posystem.com`
+- Password: `admin123`
 
-```bash
-npm run build:linux
-```
+## Scripts
 
-Output: `dist/pos-1.0.0.AppImage`
+- `npm run dev` - Start Electron + Vite dev server
+- `npm run build` - Typecheck and build production bundles
+- `npm run build:win` - Build Windows installer
+- `npm run build:mac` - Build macOS app
+- `npm run build:linux` - Build Linux app
+- `npm run typecheck` - Run TypeScript checks
+- `npm run lint` - Run ESLint
+- `npm run format` - Run Prettier
 
-## 🤝 Contributing
+## Local Data Storage
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+The offline cache is stored as `pos-local.sqlite` in the Electron user data directory and is
+initialized from `resources/sqlite-schema.sql`.
 
-## 📄 License
+## License
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
-
-## 👨‍💻 Author
-
-**isurusajith68**
-
-- GitHub: [@isurusajith68](https://github.com/isurusajith68)
-
-## 🙏 Acknowledgments
-
-- Built with [Electron](https://electronjs.org/)
-- UI powered by [React](https://reactjs.org/)
-- Database management with [Prisma](https://prisma.io/)
-- Styling with [Tailwind CSS](https://tailwindcss.com/)
-
----
-
-⭐ **Star this repository if you find it helpful!**
+MIT License. See `LICENSE`.
