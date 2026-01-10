@@ -125,6 +125,7 @@ export interface SettingsState {
   printCopies: number;
   silentPrint: boolean;
   printPreview: boolean;
+  receiptTemplate: string;
   scannerEnabled: boolean;
   scannerAutoFocus: boolean;
 }
@@ -155,6 +156,7 @@ export const DEFAULT_SETTINGS: SettingsState = {
   printCopies: 1,
   silentPrint: true,
   printPreview: false,
+  receiptTemplate: "standard",
   scannerEnabled: true,
   scannerAutoFocus: true
 };

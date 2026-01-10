@@ -133,7 +133,8 @@ const SalesInvoices: React.FC = () => {
       selectedPrinter: settings.selectedPrinter,
       printCopies: settings.printCopies,
       silentPrint: settings.silentPrint,
-      printPreview: settings.printPreview
+      printPreview: settings.printPreview,
+      receiptTemplate: settings.receiptTemplate
     }),
     [settings]
   );
@@ -676,7 +677,8 @@ const SalesInvoices: React.FC = () => {
         margin: "0 0 0 0",
         copies: printerSettings.printCopies,
         preview: printerSettings.printPreview,
-        silent: printerSettings.silentPrint
+        silent: printerSettings.silentPrint,
+        receiptTemplate: printerSettings.receiptTemplate
       };
 
       // Print the receipt using the printer service

@@ -52,6 +52,7 @@ interface SettingsState {
   printCopies: number;
   silentPrint: boolean;
   printPreview: boolean;
+  receiptTemplate: string;
   // Scanner settings
   scannerEnabled: boolean;
   scannerAutoFocus: boolean;
@@ -443,7 +444,13 @@ const SettingsManagement: React.FC = () => {
     const systemKeys = ["darkMode", "language", "lowStockThreshold"];
     const notificationKeys = ["notifications", "lowStockNotifications", "salesNotifications"];
     const backupKeys = ["autoBackup", "backupFrequency", "backupRetention"];
-    const printerKeys = ["selectedPrinter", "printCopies", "silentPrint", "printPreview"];
+    const printerKeys = [
+      "selectedPrinter",
+      "printCopies",
+      "silentPrint",
+      "printPreview",
+      "receiptTemplate"
+    ];
     const scannerKeys = ["scannerEnabled", "scannerAutoFocus"];
 
     if (generalKeys.includes(key)) return "general";
@@ -474,6 +481,7 @@ const SettingsManagement: React.FC = () => {
       printCopies: "Number of copies to print for each receipt",
       silentPrint: "Print receipts without showing print dialog",
       printPreview: "Show print preview dialog before printing",
+      receiptTemplate: "Receipt layout template used for printing",
       scannerEnabled: "Enable barcode/QR code scanner functionality",
       scannerAutoFocus: "Automatically focus input field when scanner is active"
     };
@@ -994,6 +1002,18 @@ const SettingsManagement: React.FC = () => {
       ]
     },
     {
+      id: "receiptTemplate",
+      label: "Receipt Template",
+      description: "Choose the receipt layout for printing",
+      type: "select",
+      value: settings.receiptTemplate,
+      options: [
+        { value: "standard", label: "Standard" },
+        { value: "restudent_si", label: "Restudent Sinhala" },
+        { value: "restudent_en", label: "Restudent English" }
+      ]
+    },
+    {
       id: "silentPrint",
       label: "Silent Print",
       description: "Print receipts without showing print dialog",
@@ -1014,7 +1034,10 @@ const SettingsManagement: React.FC = () => {
       type: "button",
       action: async () => {
         try {
-          const result = await window.api.printer.testPrint(settings.selectedPrinter || undefined);
+          const result = await window.api.printer.testPrint(
+            settings.selectedPrinter || undefined,
+            settings.receiptTemplate
+          );
           if (result.success) {
             toast.success(t("Test receipt printed successfully!"));
           } else {

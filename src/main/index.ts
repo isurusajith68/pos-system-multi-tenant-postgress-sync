@@ -1578,10 +1578,10 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle("printer:testPrint", async (_, printerName) => {
+  ipcMain.handle("printer:testPrint", async (_, printerName, receiptTemplate) => {
     try {
       console.log("Main process: Received testPrint IPC call with printer:", printerName);
-      const result = await printerService.printTest(printerName);
+      const result = await printerService.printTest(printerName, receiptTemplate);
       console.log("Main process: Test print result:", result);
       return result;
     } catch (error) {

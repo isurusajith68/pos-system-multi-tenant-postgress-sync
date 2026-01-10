@@ -400,8 +400,8 @@ const api = {
       printerName?: string,
       config?: Partial<PrinterConfig>
     ) => ipcRenderer.invoke("printer:printReceipt", receiptData, printerName, config),
-    testPrint: (printerName?: string) => {
-      return ipcRenderer.invoke("printer:testPrint", printerName);
+    testPrint: (printerName?: string, receiptTemplate?: string) => {
+      return ipcRenderer.invoke("printer:testPrint", printerName, receiptTemplate);
     }
   },
 

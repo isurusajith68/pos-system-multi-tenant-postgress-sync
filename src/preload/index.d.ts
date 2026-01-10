@@ -327,6 +327,16 @@ interface ReceiptData {
   footer?: string;
 }
 
+interface PrinterConfig {
+  width: number;
+  height: number;
+  margin: string;
+  copies: number;
+  preview: boolean;
+  silent: boolean;
+  receiptTemplate?: string;
+}
+
 interface ScannedData {
   type: "barcode" | "qrcode" | "unknown";
   data: string;
@@ -619,7 +629,10 @@ declare global {
           printerName?: string,
           config?: PrinterConfig
         ) => Promise<{ success: boolean; error?: string }>;
-        testPrint: (printerName?: string) => Promise<{ success: boolean; error?: string }>;
+        testPrint: (
+          printerName?: string,
+          receiptTemplate?: string
+        ) => Promise<{ success: boolean; error?: string }>;
       };
 
       scanner: {
