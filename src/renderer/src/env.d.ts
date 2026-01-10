@@ -140,7 +140,10 @@ interface Window {
         printerName?: string,
         config?: any
       ) => Promise<{ success: boolean; error?: string }>;
-      testPrint: (printerName?: string) => Promise<{ success: boolean; error?: string }>;
+      testPrint: (
+        printerName?: string,
+        receiptTemplate?: string
+      ) => Promise<{ success: boolean; error?: string }>;
     };
     scanner: {
       getDevices: () => Promise<
