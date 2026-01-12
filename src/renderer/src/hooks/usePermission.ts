@@ -35,7 +35,6 @@ export const usePermission = (employeeId?: string): UsePermissionReturn => {
     try {
       setLoading(true);
       setError(null);
-
       const employeePermissions = await window.electron.ipcRenderer.invoke(
         "rolePermissions:getEmployeePermissions",
         employeeId

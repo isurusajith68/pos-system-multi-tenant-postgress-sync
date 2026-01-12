@@ -2058,52 +2058,93 @@ export const employeeService = {
       }
 
       if (data.roleId) {
-        const timestamp = nowIso();
-        const roleInsert = {
-          employee_id: id,
-          role_id: data.roleId,
-          assigned_at: timestamp,
-          assigned_by: null,
-          version: 1,
-          created_at: timestamp,
-          updated_at: timestamp,
-          deleted_at: null,
-          last_modified_by_device_id: deviceId
-        };
-        db.prepare(
-          `
-            INSERT INTO employee_roles (
-              employee_id,
-              role_id,
-              assigned_at,
-              assigned_by,
-              version,
-              created_at,
-              updated_at,
-              deleted_at,
-              last_modified_by_device_id
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `
-        ).run(
-          roleInsert.employee_id,
-          roleInsert.role_id,
-          roleInsert.assigned_at,
-          roleInsert.assigned_by,
-          roleInsert.version,
-          roleInsert.created_at,
-          roleInsert.updated_at,
-          roleInsert.deleted_at,
-          roleInsert.last_modified_by_device_id
-        );
+        const existingRole = db
+          .prepare("SELECT * FROM employee_roles WHERE employee_id = ? AND role_id = ?")
+          .get(id, data.roleId);
 
-        enqueueOutbox(
-          "employee_roles",
-          buildCompositeRowId({ employee_id: roleInsert.employee_id, role_id: roleInsert.role_id }),
-          "insert",
-          roleInsert.version,
-          roleInsert
-        );
+        if (existingRole) {
+          const updatedAt = nowIso();
+          const roleVersion = Number(existingRole.version ?? 1) + 1;
+          const payload = {
+            ...existingRole,
+            deleted_at: null,
+            version: roleVersion,
+            updated_at: updatedAt,
+            last_modified_by_device_id: deviceId
+          };
+          db.prepare(
+            `
+              UPDATE employee_roles
+              SET deleted_at = ?, version = ?, updated_at = ?, last_modified_by_device_id = ?
+              WHERE employee_id = ? AND role_id = ?
+            `
+          ).run(
+            payload.deleted_at,
+            payload.version,
+            payload.updated_at,
+            payload.last_modified_by_device_id,
+            payload.employee_id,
+            payload.role_id
+          );
+
+          enqueueOutbox(
+            "employee_roles",
+            buildCompositeRowId({ employee_id: payload.employee_id, role_id: payload.role_id }),
+            "update",
+            payload.version,
+            payload
+          );
+        } else {
+          const timestamp = nowIso();
+          const roleInsert = {
+            employee_id: id,
+            role_id: data.roleId,
+            assigned_at: timestamp,
+            assigned_by: null,
+            version: 1,
+            created_at: timestamp,
+            updated_at: timestamp,
+            deleted_at: null,
+            last_modified_by_device_id: deviceId
+          };
+          db.prepare(
+            `
+              INSERT INTO employee_roles (
+                employee_id,
+                role_id,
+                assigned_at,
+                assigned_by,
+                version,
+                created_at,
+                updated_at,
+                deleted_at,
+                last_modified_by_device_id
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `
+          ).run(
+            roleInsert.employee_id,
+            roleInsert.role_id,
+            roleInsert.assigned_at,
+            roleInsert.assigned_by,
+            roleInsert.version,
+            roleInsert.created_at,
+            roleInsert.updated_at,
+            roleInsert.deleted_at,
+            roleInsert.last_modified_by_device_id
+          );
+
+          enqueueOutbox(
+            "employee_roles",
+            buildCompositeRowId({
+              employee_id: roleInsert.employee_id,
+              role_id: roleInsert.role_id
+            }),
+            "insert",
+            roleInsert.version,
+            roleInsert
+          );
+        }
       }
     }
 

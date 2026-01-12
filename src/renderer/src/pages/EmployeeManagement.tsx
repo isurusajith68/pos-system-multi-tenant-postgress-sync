@@ -71,6 +71,12 @@ const EmployeeManagement: React.FC = () => {
     return employee.role || undefined;
   };
 
+  const selectedRoleName =
+    formData.roleId && roles.length > 0
+      ? roles.find((role) => role.id === formData.roleId)?.name ?? formData.role
+      : formData.role;
+  const isAdministratorEdit = isEditing && selectedRoleName === "Administrator";
+
   useEffect(() => {
     fetchEmployees();
     fetchRoles();
@@ -284,15 +290,16 @@ const EmployeeManagement: React.FC = () => {
                       type="text"
                       value={formData.employee_id}
                       onChange={(e) => setFormData({ ...formData, employee_id: e.target.value })}
-                      className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white dark:bg-slate-900 text-gray-900 dark:text-slate-100"
+                      className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white dark:bg-slate-900 text-gray-900 dark:text-slate-100 disabled:bg-gray-100 disabled:text-gray-500 dark:disabled:bg-slate-800 dark:disabled:text-slate-400"
                       required
-                      disabled={loading}
+                      disabled={loading || isAdministratorEdit || isEditing}
                       placeholder="EMP123456789"
                     />
                     <button
                       type="button"
                       onClick={generateEmployeeId}
-                      className="px-3 py-2 bg-gray-100 dark:bg-slate-800 text-gray-700 dark:text-slate-200 rounded-md hover:bg-gray-200 dark:hover:bg-slate-700 text-xs font-medium transition-colors"
+                      disabled={loading || isAdministratorEdit}
+                      className="px-3 py-2 bg-gray-100 dark:bg-slate-800 text-gray-700 dark:text-slate-200 rounded-md hover:bg-gray-200 dark:hover:bg-slate-700 text-xs font-medium transition-colors disabled:opacity-50"
                     >
                       {t("Generate")}
                     </button>
@@ -306,7 +313,7 @@ const EmployeeManagement: React.FC = () => {
                     type="text"
                     value={formData.name}
                     onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white dark:bg-slate-900 text-gray-900 dark:text-slate-100"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white dark:bg-slate-900 text-gray-900 dark:text-slate-100 disabled:bg-gray-100 disabled:text-gray-500 dark:disabled:bg-slate-800 dark:disabled:text-slate-400"
                     required
                     disabled={loading}
                     placeholder="John Doe"
@@ -326,9 +333,9 @@ const EmployeeManagement: React.FC = () => {
                         role: selectedRole?.name || "" // Update legacy role field too
                       });
                     }}
-                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white dark:bg-slate-900 text-gray-900 dark:text-slate-100"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white dark:bg-slate-900 text-gray-900 dark:text-slate-100 disabled:bg-gray-100 disabled:text-gray-500 dark:disabled:bg-slate-800 dark:disabled:text-slate-400"
                     required
-                    disabled={loading}
+                    disabled={loading || isAdministratorEdit}
                   >
                     <option value="">{t("Select Role")}</option>
                     {roles.map((role) => (
@@ -346,9 +353,9 @@ const EmployeeManagement: React.FC = () => {
                     type="email"
                     value={formData.email}
                     onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white dark:bg-slate-900 text-gray-900 dark:text-slate-100"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-slate-700 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white dark:bg-slate-900 text-gray-900 dark:text-slate-100 disabled:bg-gray-100 disabled:text-gray-500 dark:disabled:bg-slate-800 dark:disabled:text-slate-400"
                     required
-                    disabled={loading}
+                    disabled={loading || isAdministratorEdit || isEditing}
                     placeholder="john.doe@company.com"
                   />
                 </div>
@@ -360,7 +367,7 @@ const EmployeeManagement: React.FC = () => {
                     type="text"
                     value={formData.address}
                     onChange={(e) => setFormData({ ...formData, address: e.target.value })}
-                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 disabled:bg-gray-100 disabled:text-gray-500"
                     disabled={loading}
                     placeholder={t("Enter address")}
                   />
@@ -374,7 +381,7 @@ const EmployeeManagement: React.FC = () => {
                       type={showPassword ? "text" : "password"}
                       value={formData.password}
                       onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-                      className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 pr-10"
+                      className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-500 pr-10 disabled:bg-gray-100 disabled:text-gray-500"
                       required={!isEditing}
                       disabled={loading}
                       placeholder={
@@ -531,7 +538,7 @@ const EmployeeManagement: React.FC = () => {
                       <td className="px-4 py-3 text-sm space-x-2">
                         <button
                           onClick={() => handleEdit(employee)}
-                          disabled={loading || currentUser?.id === employee.id}
+                          disabled={loading}
                           className="px-3 py-1.5 bg-yellow-500 text-white rounded hover:bg-yellow-600 focus:outline-none focus:ring-2 focus:ring-yellow-500 disabled:opacity-50 text-xs font-medium"
                         >
                           {t("Edit")}
@@ -541,7 +548,9 @@ const EmployeeManagement: React.FC = () => {
                           disabled={
                             loading ||
                             employee.role === "Administrator" ||
-                            employee.employeeRoles?.some((entry) => entry.role?.name === "Administrator")
+                            employee.employeeRoles?.some(
+                              (entry) => entry.role?.name === "Administrator"
+                            )
                           }
                           className="px-3 py-1.5 bg-red-500 text-white rounded hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 disabled:opacity-50 text-xs font-medium"
                         >
